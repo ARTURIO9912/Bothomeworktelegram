@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta
 import asyncio
 import aiosqlite
+import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -16,6 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws"
 ADMIN_CHAT_ID = 6243658367
+GROQ_API_KEY = "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"
 
 SEND_HOUR = 15
 SEND_MINUTE = 30
@@ -112,6 +114,39 @@ async def restore_from_backup():
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
+async def improve_with_ai(subject: str, raw_task: str) -> str:
+    prompt = f"""Ты помощник старосты школьного класса.
+Твоя задача — сделать черновик домашнего задания понятным, аккуратным и структурированным.
+
+Предмет: {subject}
+Черновик: {raw_task}
+
+Правила:
+1. Исправь грамматические и пунктуационные ошибки, оформи пункты понятно.
+2. СТРОЖАЙШЕЕ ПРАВИЛО: Не изменяй, не перефразируй и не сокращай названия тем, термины и цитаты. Если написано "объяснить смысл темы X", само название темы X должно остаться точно в таком виде, как написал автор.
+3. Если в задании чего-то явно не хватает для понимания (например: сказано перевести текст, но нет страницы; сказано сделать номер, но нет номера упражнения), напиши в самом конце отдельной строкой:
+Вопрос для уточнения: [напиши, что именно нужно уточнить]
+4. Ни в коем случае не используй смайлики и эмодзи.
+5. Выведи только готовый итоговый текст задания без вступительных фраз.
+"""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2
+                }
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                return result["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.error(f"Ошибка вызова ИИ: {e}")
+    return raw_task
+
 def normalize_subject(name: str) -> str:
     s = name.strip().lower()
     aliases = {
@@ -171,7 +206,7 @@ async def start_cmd(msg: Message):
         "/cancel — отмена текущего действия\n\n"
         "Отправка заданий:\n"
         "- Фото доски: фото с названием предмета в подписи (например: Литература или Химия: задачи 1 и 2)\n"
-        "- Текстом: Литература: прочитать главу 3"
+        "- Текстом: Литература: объяснить смысл темы 'Понятие о чести'"
     )
 
 @dp.message(Command("cancel"))
@@ -256,12 +291,22 @@ async def edit_text_finish(msg: Message, state: FSMContext):
         return
     data = await state.get_data()
     hw_id = data["hw_id"]
+
+    wait_msg = await msg.answer("Обработка текста через ИИ...")
     async with aiosqlite.connect("school.db") as db:
-        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (new_text, hw_id))
+        async with db.execute("SELECT subject FROM homework WHERE id = ?", (hw_id,)) as cursor:
+            row = await cursor.fetchone()
+            subj = row[0] if row else "Предмет"
+
+    better_text = await improve_with_ai(subj, new_text)
+    await wait_msg.delete()
+
+    async with aiosqlite.connect("school.db") as db:
+        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (better_text, hw_id))
         await db.commit()
     await sync_backup()
     await state.clear()
-    await msg.answer(f"Текст задания #{hw_id} успешно обновлен на:\n{new_text}")
+    await msg.answer(f"Текст задания #{hw_id} успешно обновлен на:\n{better_text}")
 
 @dp.callback_query(F.data.startswith("edit_subj:"))
 async def edit_subj_start(call: CallbackQuery, state: FSMContext):
@@ -324,9 +369,17 @@ async def handle_homework(msg: Message):
         return
 
     if photo_id:
-        final_text = f"Задание на фото с доски.\nПримечание: {task}" if task else "Задание на фото с доски."
+        if task:
+            wait_msg = await msg.answer("Обработка подписи к фото...")
+            refined_task = await improve_with_ai(matched_name, task)
+            await wait_msg.delete()
+            final_text = f"Задание на фото с доски.\nПримечание: {refined_task}"
+        else:
+            final_text = "Задание на фото с доски."
     else:
-        final_text = task if task else "Задание от учителя."
+        wait_msg = await msg.answer("Обработка текста через ИИ...")
+        final_text = await improve_with_ai(matched_name, task if task else "Смотри задание")
+        await wait_msg.delete()
 
     send_date_str = lesson_date.strftime("%Y-%m-%d")
 
