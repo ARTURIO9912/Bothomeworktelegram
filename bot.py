@@ -22,7 +22,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws"
 ADMIN_CHAT_ID = 6243658367
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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").strip()
+
+# Ключ безопасно берется из Environment на Render
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
 SEND_HOUR = 15
 SEND_MINUTE = 30
@@ -130,22 +132,22 @@ async def restore_from_backup():
 async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "") -> str:
     key = GROQ_API_KEY
     if not key:
-        return f"{raw_task}\n\n<i>(⚠️ Не указан GROQ_API_KEY)</i>"
+        return f"{raw_task}\n\n<i>(⚠️ Не указан GROQ_API_KEY в Environment на Render)</i>"
 
     user_note = f"\nПожелание ученика: {user_instruction}" if user_instruction else ""
 
-    prompt = f"""Ты помощник старосты школьного класса. Перепиши черновик домашнего задания так, чтобы оно было аккуратным, понятным и готовым для отправки в беседу класса.
+    prompt = f"""Ты школьный помощник. Перепиши черновик домашнего задания так, чтобы оно было аккуратным, понятным и удобным для чтения в группе класса.
 
 Предмет: {subject}
 Черновик: {raw_task}{user_note}
 
-Правила:
-1. Исправь все орфографические и пунктуационные ошибки.
-2. Оформи аккуратным нумерованным списком (1, 2, 3), если пунктов несколько.
-3. ВАЖНО: Ни в коем случае не меняй, не сокращай и не искажай названия тем, формулировки терминов и цитаты. Если написано "объяснить смысл темы Х", название темы Х должно остаться точным, слово в слово.
-4. Если не хватает важных деталей (например, не указана страница текста или номер упражнения), добавь в конце отдельной строкой:
+Инструкция:
+1. Исправь орфографические и пунктуационные ошибки.
+2. Оформи нумерованным списком (1, 2, 3), если пунктов несколько.
+3. ВАЖНО: Не изменяй и не сокращай названия тем, термины и цитаты. Если написано "объяснить смысл темы Х", название темы Х должно остаться точным.
+4. Если не хватает деталей (нет номера упражнения или страницы), добавь в конце:
 ⚠️ Вопрос для уточнения: [что нужно уточнить]
-5. Выведи ТОЛЬКО готовый текст домашнего задания без вступительных слов и без лишних пустых фраз.
+5. Выведи ТОЛЬКО готовый текст домашнего задания без вступительных слов.
 """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -166,7 +168,7 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
                 return result["choices"][0]["message"]["content"].strip()
             else:
                 logging.error(f"Groq API Error {resp.status_code}: {resp.text}")
-                return f"{raw_task}\n\n<i>(⚠️ Ошибка Groq {resp.status_code}: ключ отозван или неверен)</i>"
+                return f"{raw_task}\n\n<i>(⚠️ Ошибка Groq {resp.status_code})</i>"
     except Exception as e:
         logging.error(f"Ошибка вызова ИИ: {e}")
         return f"{raw_task}\n\n<i>(⚠️ Ошибка соединения с ИИ: {e})</i>"
