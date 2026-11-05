@@ -80,6 +80,7 @@ async def init_db():
                 task_text TEXT,
                 photo_id TEXT,
                 send_date TEXT,
+                lesson_date TEXT,
                 is_sent INTEGER DEFAULT 0
             )
         """)
@@ -126,6 +127,24 @@ async def restore_from_backup():
             print("База восстановлена из резервной копии.")
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
+
+# Автоматический пересчет существующих дат в базе (сдвиг на день раньше)
+async def fix_existing_dates():
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, subject FROM homework WHERE is_sent = 0") as cursor:
+            rows = await cursor.fetchall()
+            for r in rows:
+                lesson_d, _ = find_next_lesson_date(r["subject"])
+                if lesson_d:
+                    reminder_d = lesson_d - timedelta(days=1)
+                    await db.execute(
+                        "UPDATE homework SET send_date = ? WHERE id = ?",
+                        (reminder_d.strftime("%Y-%m-%d"), r["id"])
+                    )
+        await db.commit()
+    await sync_backup()
+    print("Существующие даты успешно обновлены на день накануне!")
 
 async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "") -> str:
     instruction_part = f"Дополнительное указание от ученика: {user_instruction}" if user_instruction else "Сделай текст аккуратным, понятным и структурированным."
@@ -255,6 +274,7 @@ async def view_schedule_cmd(msg: Message):
         lines.append("")
     await msg.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
 
+# Список всех ДЗ (отправка строго НАКАНУНЕ в 15:30)
 @dp.message(F.text == "📚 Список ДЗ")
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
@@ -275,16 +295,19 @@ async def view_homework_cmd(msg: Message):
     await msg.answer(f"📋 <b>В очереди заданий: {total}</b>\nНиже карточки каждого урока:", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
 
     for idx, row in enumerate(rows, start=1):
-        target_date = datetime.strptime(row["send_date"], "%Y-%m-%d").date()
-        weekday_name = DAYS_MAP[target_date.weekday()].capitalize()
-        formatted_date = f"{weekday_name}, {target_date.strftime('%d.%m')}"
+        send_date_obj = datetime.strptime(row["send_date"], "%Y-%m-%d").date()
+        lesson_date_obj = send_date_obj + timedelta(days=1)
+        
+        send_weekday = DAYS_MAP[send_date_obj.weekday()].capitalize()
+        lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
         escaped_task = html.escape(row["task_text"])
 
         card_text = (
             f"📌 <b>Задание {idx} из {total}</b>\n"
             f"📚 Предмет: <b>{html.escape(row['subject'])}</b>\n"
-            f"📅 Отправка: <b>{formatted_date} в 15:30</b>\n\n"
+            f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
+            f"⏰ Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
             f"📝 <b>Что задано:</b>\n"
             f"<blockquote>{escaped_task}</blockquote>"
         )
@@ -303,7 +326,7 @@ async def delete_hw_callback(call: CallbackQuery):
         await db.commit()
     await sync_backup()
     await call.answer("🗑 Задание удалено.")
-    del_text = "🗑 <b>Задание успешно удалено из очереди.</b>\nЧтобы увидеть обновленный список с правильной нумерацией, нажми «📚 Список ДЗ»."
+    del_text = "🗑 <b>Задание успешно удалено из очереди.</b>\nЧтобы увидеть обновленный список, нажми «📚 Список ДЗ»."
     if call.message.photo:
         await call.message.edit_caption(caption=del_text, parse_mode="HTML")
     else:
@@ -389,7 +412,7 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# Смена предмета
+# Смена предмета (дата ставится накануне урока)
 @dp.callback_query(F.data.startswith("edit_subj:"))
 async def edit_subj_start(call: CallbackQuery, state: FSMContext):
     hw_id = int(call.data.split(":")[1])
@@ -406,9 +429,12 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
         await msg.answer(f"❌ Предмет «{html.escape(new_subj)}» не найден в расписании 8-Б класса. Попробуй еще раз или нажми «❌ Отмена».", parse_mode="HTML")
         return
 
+    # Отправка строго НАКАНУНЕ
+    reminder_date = lesson_date - timedelta(days=1)
+    send_date_str = reminder_date.strftime("%Y-%m-%d")
+
     data = await state.get_data()
     hw_id = data["hw_id"]
-    send_date_str = lesson_date.strftime("%Y-%m-%d")
 
     async with aiosqlite.connect("school.db") as db:
         await db.execute(
@@ -419,16 +445,20 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
 
     await sync_backup()
     await state.clear()
-    weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
+    
+    send_weekday = DAYS_MAP[reminder_date.weekday()].capitalize()
+    lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
+
     await msg.answer(
         f"✅ <b>Предмет успешно изменен!</b>\n\n"
         f"📚 Новый предмет: <b>{html.escape(matched_name)}</b>\n"
-        f"📅 Новая дата отправки: <b>{weekday_ru}, {lesson_date.strftime('%d.%m')} в 15:30</b>",
+        f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
+        f"⏰ Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне)",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
 
-# Прием нового задания
+# Прием нового задания (отправка за день до урока в 15:30)
 @dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
     photo_id = None
@@ -467,7 +497,9 @@ async def handle_homework(msg: Message):
         final_text = await improve_with_ai(matched_name, task if task else "Смотри задание от учителя")
         await wait_msg.delete()
 
-    send_date_str = lesson_date.strftime("%Y-%m-%d")
+    # НАПОМИНАНИЕ СТРОГО НАКАНУНЕ
+    reminder_date = lesson_date - timedelta(days=1)
+    send_date_str = reminder_date.strftime("%Y-%m-%d")
 
     async with aiosqlite.connect("school.db") as db:
         cursor = await db.execute("""
@@ -479,14 +511,15 @@ async def handle_homework(msg: Message):
 
     await sync_backup()
 
-    weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
+    send_weekday = DAYS_MAP[reminder_date.weekday()].capitalize()
+    lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
     escaped_task = html.escape(final_text)
     
     confirm = (
         f"✅ <b>Задание успешно сохранено!</b>\n\n"
         f"📚 Предмет: <b>{html.escape(matched_name)}</b>\n"
-        f"📅 Ближайший урок: <b>{weekday_ru}, {lesson_date.strftime('%d.%m')}</b>\n"
-        f"⏰ Отправка: <b>в этот же день в 15:30</b>\n\n"
+        f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
+        f"⏰ Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
         f"📝 <b>Что будет отправлено:</b>\n"
         f"<blockquote>{escaped_task}</blockquote>"
     )
@@ -497,7 +530,7 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
-# Рассылка в 15:30
+# Рассылка в 15:30 (приходит накануне урока)
 async def send_daily():
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     async with aiosqlite.connect("school.db") as db:
@@ -510,7 +543,7 @@ async def send_daily():
             for row in rows:
                 escaped_task = html.escape(row['task_text'])
                 text = (
-                    f"🔔 <b>ДОМАШНЕЕ ЗАДАНИЕ НА СЕГОДНЯ</b>\n"
+                    f"🔔 <b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
                     f"📖 Предмет: <b>{html.escape(row['subject'])}</b>\n\n"
                     f"<blockquote>{escaped_task}</blockquote>\n\n"
                     f"<i>(Перешли это сообщение в группу класса)</i>"
@@ -529,6 +562,7 @@ async def main():
     await init_db()
     await start_web_server()
     await restore_from_backup()
+    await fix_existing_dates()
     
     scheduler.add_job(send_daily, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
