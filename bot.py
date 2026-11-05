@@ -21,11 +21,12 @@ SEND_HOUR = 15
 SEND_MINUTE = 30
 PORT = int(os.environ.get("PORT", 10000))
 
+# Расписание 8-Б класса
 SCHEDULE = {
     0: ["рум. яз.", "англ. яз.", "история", "математика", "физика", "география", "информ."],
     1: ["муз. восп.", "рум. яз.", "история", "болг. яз.", "гв", "рус. яз.", "англ. яз."],
     2: ["рус. язык", "болг. язык", "рус. язык", "физ. восп.", "математика", "биология", "рум. яз."],
-    3: ["рум. яз.", "химия", "рус. яз.", "рус. яз.", "математика", "физика", "физ. восп."],
+    3: ["рум. яз.", "химия", "литература", "литература", "математика", "физика", "физ. восп."],
     4: ["труд", "химия", "биология", "иктбн", "болг. яз.", "математика", "рл"]
 }
 
@@ -40,7 +41,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone="Europe/Chisinau")
 
-# Состояния редактирования
 class EditHW(StatesGroup):
     waiting_for_text = State()
     waiting_for_subject = State()
@@ -128,7 +128,8 @@ def normalize_subject(name: str) -> str:
         "англ": "англ. яз.", "английский": "англ. яз.",
         "физра": "физ. восп.", "физкультура": "физ. восп.",
         "муз": "муз. восп.", "музыка": "муз. восп.",
-        "рл": "рл", "лит": "рл", "литература": "рл",
+        "лит": "литература", "литература": "литература", "лит-ра": "литература",
+        "рл": "рл", "развитие": "рл", "разв": "рл", "развитие личности": "рл",
         "труд": "труд", "труды": "труд",
         "гв": "гв"
     }
@@ -169,8 +170,8 @@ async def start_cmd(msg: Message):
         "/расписание — расписание уроков на неделю\n"
         "/cancel — отмена текущего действия\n\n"
         "Отправка заданий:\n"
-        "- Фото доски: фото с названием предмета в подписи (например: Химия или Химия: задачи 1 и 2)\n"
-        "- Текстом: Румынский: выучить слова на стр 15"
+        "- Фото доски: фото с названием предмета в подписи (например: Литература или Химия: задачи 1 и 2)\n"
+        "- Текстом: Литература: прочитать главу 3"
     )
 
 @dp.message(Command("cancel"))
@@ -184,7 +185,6 @@ async def cancel_fsm(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Действие отменено.")
 
-# Просмотр расписания уроков на неделю
 @dp.message(Command("расписание"))
 async def view_schedule_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -197,7 +197,6 @@ async def view_schedule_cmd(msg: Message):
             lines.append(f"  {num}. {subj.capitalize()}")
     await msg.answer("\n".join(lines))
 
-# Просмотр всех сохраненных заданий
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -227,7 +226,6 @@ async def view_homework_cmd(msg: Message):
         else:
             await msg.answer(text=text, reply_markup=kb)
 
-# Удаление задания
 @dp.callback_query(F.data.startswith("del_hw:"))
 async def delete_hw_callback(call: CallbackQuery):
     hw_id = int(call.data.split(":")[1])
@@ -242,7 +240,6 @@ async def delete_hw_callback(call: CallbackQuery):
     else:
         await call.message.edit_text(text=del_text)
 
-# Изменение текста: запрос нового текста
 @dp.callback_query(F.data.startswith("edit_text:"))
 async def edit_text_start(call: CallbackQuery, state: FSMContext):
     hw_id = int(call.data.split(":")[1])
@@ -251,7 +248,6 @@ async def edit_text_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await call.message.reply(f"Отправь новый текст задания для #{hw_id}.\nДля отмены напиши /cancel.")
 
-# Изменение текста: сохранение
 @dp.message(EditHW.waiting_for_text, F.from_user.id == ADMIN_CHAT_ID)
 async def edit_text_finish(msg: Message, state: FSMContext):
     new_text = msg.text or msg.caption or ""
@@ -267,7 +263,6 @@ async def edit_text_finish(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(f"Текст задания #{hw_id} успешно обновлен на:\n{new_text}")
 
-# Изменение предмета: запрос названия
 @dp.callback_query(F.data.startswith("edit_subj:"))
 async def edit_subj_start(call: CallbackQuery, state: FSMContext):
     hw_id = int(call.data.split(":")[1])
@@ -276,7 +271,6 @@ async def edit_subj_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await call.message.reply(f"Отправь новое название предмета для #{hw_id}.\nДля отмены напиши /cancel.")
 
-# Изменение предмета: пересчет даты и сохранение
 @dp.message(EditHW.waiting_for_subject, F.from_user.id == ADMIN_CHAT_ID)
 async def edit_subj_finish(msg: Message, state: FSMContext):
     new_subj = (msg.text or "").strip()
@@ -304,7 +298,6 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
         f"Новая дата отправки: {weekday_ru}, {lesson_date.strftime('%d.%m')} в 15:30"
     )
 
-# Прием нового домашнего задания (срабатывает, только если не включен режим редактирования)
 @dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
     photo_id = None
@@ -362,7 +355,6 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb)
 
-# Ежедневная отправка в 15:30
 async def send_daily():
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     async with aiosqlite.connect("school.db") as db:
