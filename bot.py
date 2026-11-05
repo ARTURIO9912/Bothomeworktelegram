@@ -3,6 +3,7 @@ import json
 import html
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import asyncio
 import aiosqlite
 import httpx
@@ -22,9 +23,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws"
 ADMIN_CHAT_ID = 6243658367
-
-# Ключ безопасно берется из Environment на Render
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+
+# Часовой пояс Молдовы
+TZ = ZoneInfo("Europe/Chisinau")
 
 SEND_HOUR = 15
 SEND_MINUTE = 30
@@ -47,7 +49,7 @@ DAYS_MAP = {
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler(timezone="Europe/Chisinau")
+scheduler = AsyncIOScheduler(timezone=TZ)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -129,6 +131,24 @@ async def restore_from_backup():
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
+# Принудительно выставляет даты отправки НАКАНУНЕ уроков
+async def fix_all_dates():
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, subject FROM homework WHERE is_sent = 0") as cursor:
+            rows = await cursor.fetchall()
+            for r in rows:
+                lesson_d, _ = find_next_lesson_date(r["subject"])
+                if lesson_d:
+                    reminder_d = lesson_d - timedelta(days=1)
+                    await db.execute(
+                        "UPDATE homework SET send_date = ? WHERE id = ?",
+                        (reminder_d.strftime("%Y-%m-%d"), r["id"])
+                    )
+        await db.commit()
+    await sync_backup()
+    print("Все даты скорректированы на день накануне урока!")
+
 async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "") -> str:
     key = GROQ_API_KEY
     if not key:
@@ -201,7 +221,7 @@ def normalize_subject(name: str) -> str:
 
 def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[None, None]:
     norm_subj = normalize_subject(subj_query)
-    today = datetime.now().date()
+    today = datetime.now(TZ).date()
     for offset in range(1, 15):
         target_date = today + timedelta(days=offset)
         weekday = target_date.weekday()
@@ -509,8 +529,10 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
+# Функция отправки
 async def send_due_homework() -> int:
-    today_str = datetime.now().date().strftime("%Y-%m-%d")
+    now_md = datetime.now(TZ)
+    today_str = now_md.strftime("%Y-%m-%d")
     sent_count = 0
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
@@ -558,12 +580,15 @@ async def main():
     await init_db()
     await start_web_server()
     await restore_from_backup()
+    await fix_all_dates()
     
     scheduler.add_job(send_due_homework, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
     
-    now = datetime.now()
+    # Проверяем точное время Молдовы
+    now = datetime.now(TZ)
     if now.hour > SEND_HOUR or (now.hour == SEND_HOUR and now.minute >= SEND_MINUTE):
+        print("Текущее время больше 15:30, отправляем ДЗ...")
         await send_due_homework()
 
     print("Бот 8-Б класса запущен.")
