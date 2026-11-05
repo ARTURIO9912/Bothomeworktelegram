@@ -7,29 +7,38 @@ import aiosqlite
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ================= НАСТРОЙКИ =================
+# ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws"
 ADMIN_CHAT_ID = 6243658367
 
 SEND_HOUR = 15
 SEND_MINUTE = 30
 PORT = int(os.environ.get("PORT", 10000))
-# =============================================
+
+# ТВОЕ ТОЧНОЕ РАСПИСАНИЕ (8-Б КЛАСС)
+SCHEDULE = {
+    0: ["рум. яз.", "англ. яз.", "история", "математика", "физика", "география", "информ."],
+    1: ["муз. восп.", "рум. яз.", "история", "болг. яз.", "гв", "рус. яз.", "англ. яз."],
+    2: ["рус. язык", "болг. язык", "рус. язык", "физ. восп.", "математика", "биология", "рум. яз."],
+    3: ["рум. яз.", "химия", "рус. яз.", "рус. яз.", "математика", "физика", "физ. восп."],
+    4: ["труд", "химия", "биология", "иктбн", "болг. яз.", "математика", "рл"]
+}
+
+DAYS_MAP = {
+    0: "понедельник", 1: "вторник", 2: "среда",
+    3: "четверг", 4: "пятница", 5: "суббота", 6: "воскресенье"
+}
+# ===============================================
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone="Europe/Chisinau")
 
-DAYS_MAP = {
-    0: "понедельник", 1: "вторник", 2: "среда",
-    3: "четверг", 4: "пятница", 5: "суббота", 6: "воскресенье"
-}
-
-# Веб-сервер для жизни на хостинге
+# Фоновый сервер для Render
 async def web_handle(request):
     return web.Response(text="Bot is running!")
 
@@ -41,6 +50,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
+# --- База данных ---
 async def init_db():
     async with aiosqlite.connect("school.db") as db:
         await db.execute("""
@@ -53,95 +63,106 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS schedule (
-                day_index INTEGER PRIMARY KEY,
-                subjects_json TEXT
-            )
-        """)
         await db.commit()
 
-async def get_schedule():
-    schedule = {}
+# --- Резервная копия в Telegram (чтобы ДЗ не пропадало при перезапуске сервера) ---
+async def sync_backup():
     async with aiosqlite.connect("school.db") as db:
-        async with db.execute("SELECT day_index, subjects_json FROM schedule") as cursor:
-            async for row in cursor:
-                schedule[row[0]] = json.loads(row[1])
-    return schedule
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0") as cursor:
+            rows = await cursor.fetchall()
+            data = [dict(row) for row in rows]
 
-async def find_lesson_date(subject: str) -> datetime.date | None:
-    subject = subject.strip().lower()
-    schedule = await get_schedule()
-    if not schedule:
-        return None
+    backup_text = f"📦 BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
+    
+    try:
+        chat = await bot.get_chat(ADMIN_CHAT_ID)
+        pinned = chat.pinned_message
+        if pinned and "BACKUP_DATA" in (pinned.text or ""):
+            await bot.edit_message_text(backup_text, chat_id=ADMIN_CHAT_ID, message_id=pinned.message_id)
+        else:
+            msg = await bot.send_message(ADMIN_CHAT_ID, backup_text, disable_notification=True)
+            await bot.pin_chat_message(ADMIN_CHAT_ID, msg.message_id, disable_notification=True)
+    except Exception as e:
+        logging.error(f"Ошибка бэкапа: {e}")
 
+async def restore_from_backup():
+    try:
+        chat = await bot.get_chat(ADMIN_CHAT_ID)
+        pinned = chat.pinned_message
+        if pinned and "BACKUP_DATA" in (pinned.text or ""):
+            json_str = pinned.text.split("📦 BACKUP_DATA:\n", 1)[1]
+            data = json.loads(json_str)
+            async with aiosqlite.connect("school.db") as db:
+                for item in data:
+                    # Проверяем, есть ли уже такая запись
+                    async with db.execute(
+                        "SELECT id FROM homework WHERE subject = ? AND send_date = ? AND is_sent = 0",
+                        (item["subject"], item["send_date"])
+                    ) as cursor:
+                        if not await cursor.fetchone():
+                            await db.execute(
+                                "INSERT INTO homework (subject, task_text, photo_id, send_date) VALUES (?, ?, ?, ?)",
+                                (item["subject"], item["task_text"], item["photo_id"], item["send_date"])
+                            )
+                await db.commit()
+            print("Успешно восстановлено ДЗ из резервной копии!")
+    except Exception as e:
+        logging.error(f"Ошибка восстановления: {e}")
+
+# --- Умный поиск предмета ---
+def normalize_subject(name: str) -> str:
+    s = name.strip().lower()
+    aliases = {
+        "рум": "рум. яз.", "румынский": "рум. яз.", "рум яз": "рум. яз.",
+        "болг": "болг. яз.", "болгарский": "болг. яз.", "болг яз": "болг. яз.",
+        "рус": "рус. яз.", "русский": "рус. яз.", "рус яз": "рус. яз.",
+        "мат": "математика", "матеша": "математика", "алгебра": "математика", "геометрия": "математика",
+        "физ": "физика",
+        "био": "биология",
+        "хим": "химия",
+        "гео": "география",
+        "инф": "информ.", "информатика": "информ.", "икт": "иктбн",
+        "ист": "история",
+        "англ": "англ. яз.", "английский": "англ. яз.",
+        "физра": "физ. восп.", "физкультура": "физ. восп.",
+        "муз": "муз. восп.", "музыка": "муз. восп.",
+        "рл": "рл", "лит": "рл", "литература": "рл",
+        "труд": "труд", "труды": "труд",
+        "гв": "гв"
+    }
+    for key, val in aliases.items():
+        if key in s:
+            return val
+    return s
+
+def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[None, None]:
+    norm_subj = normalize_subject(subj_query)
     today = datetime.now().date()
+    
+    # Ищем урок на ближайшие 14 дней (начиная со следующего дня)
     for offset in range(1, 15):
         target_date = today + timedelta(days=offset)
         weekday = target_date.weekday()
-        day_subjects = schedule.get(weekday, [])
-        for item in day_subjects:
-            if subject in item.lower() or item.lower() in subject:
-                return target_date
-    return None
+        day_subjects = SCHEDULE.get(weekday, [])
+        for real_subj in day_subjects:
+            if norm_subj in real_subj or real_subj in norm_subj:
+                return target_date, real_subj.upper()
+    return None, None
 
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     await msg.answer(
-        "👋 Бот готов!\n\n"
-        "1. Настрой расписание через команду:\n"
-        "`/расписание`\n\n"
-        "2. Скидывай домашку:\n"
-        "• Текстом: `Румынский: упр 3 стр 45`\n"
-        "• Фото с доски: отправь фото с подписью `Химия`"
+        "👋 **Бот 8-Б класса готов!**\n\n"
+        "Расписание уже загружено. Просто отправляй ДЗ на переменках:\n"
+        "• **Фото доски:** прикрепи фото и подпиши `Химия` (или `Химия: упр 2`)\n"
+        "• **Текстом:** `Румынский: выучить слова на стр 15`\n\n"
+        "⏰ Бот сам найдет ближайший день этого урока и пришлет всё ровно в **15:30**."
     )
 
-# Настройка расписания прямо в чате
-@dp.message(Command("расписание"))
-async def set_schedule_cmd(msg: Message):
-    if msg.from_user.id != ADMIN_CHAT_ID:
-        return
-
-    text = msg.text.replace("/расписание", "").strip()
-    if not text:
-        await msg.answer(
-            "📋 Отправь расписание в таком виде:\n\n"
-            "`/расписание\n"
-            "Пн: Румынский, Алгебра, Химия\n"
-            "Вт: Английский, Биология\n"
-            "Ср: Физика, Румынский\n"
-            "Чт: Химия, Геометрия\n"
-            "Пт: История, Литература`"
-        )
-        return
-
-    day_aliases = {
-        "пн": 0, "понедельник": 0, "вт": 1, "вторник": 1,
-        "ср": 2, "среда": 2, "чт": 3, "четверг": 3,
-        "пт": 4, "пятница": 4, "сб": 5, "суббота": 5, "вс": 6, "воскресенье": 6
-    }
-
-    count = 0
-    async with aiosqlite.connect("school.db") as db:
-        for line in text.split("\n"):
-            if ":" in line:
-                day_str, subjs = line.split(":", 1)
-                day_key = day_str.strip().lower()
-                if day_key in day_aliases:
-                    idx = day_aliases[day_key]
-                    subjects_list = [s.strip().lower() for s in subjs.split(",") if s.strip()]
-                    await db.execute(
-                        "INSERT OR REPLACE INTO schedule (day_index, subjects_json) VALUES (?, ?)",
-                        (idx, json.dumps(subjects_list, ensure_ascii=False))
-                    )
-                    count += 1
-        await db.commit()
-
-    await msg.answer(f"✅ Расписание сохранено (дней: {count})!")
-
-# Прием домашних заданий (фото или текст)
+# --- Прием домашних заданий ---
 @dp.message(F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
     photo_id = None
@@ -151,7 +172,7 @@ async def handle_homework(msg: Message):
         photo_id = msg.photo[-1].file_id
         raw_text = (msg.caption or "").strip()
         if not raw_text:
-            await msg.answer("⚠️ Ты не подписал предмет! Отправь фото заново с подписью, например: «Химия».")
+            await msg.answer("⚠️ Ты отправил фото без названия предмета! Напиши в подписи, например: `Химия`.")
             return
     else:
         raw_text = (msg.text or "").strip()
@@ -162,12 +183,9 @@ async def handle_homework(msg: Message):
     else:
         subject, task = raw_text.strip(), ""
 
-    lesson_date = await find_lesson_date(subject)
+    lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(
-            f"❌ Предмет «{subject}» не найден в твоем расписании!\n"
-            f"Настрой его командой /расписание"
-        )
+        await msg.answer(f"❌ Не нашел предмет «{subject}» в расписании 8-Б класса. Проверь название!")
         return
 
     if photo_id:
@@ -181,15 +199,18 @@ async def handle_homework(msg: Message):
         await db.execute("""
             INSERT INTO homework (subject, task_text, photo_id, send_date)
             VALUES (?, ?, ?, ?)
-        """, (subject, final_text, photo_id, send_date_str))
+        """, (matched_name, final_text, photo_id, send_date_str))
         await db.commit()
+
+    # Синхронизируем бэкап
+    await sync_backup()
 
     weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
     confirm = (
-        f"✅ **Задание сохранено!**\n\n"
-        f"📚 Предмет: **{subject.capitalize()}**\n"
+        f"✅ **Записано в копилку!**\n\n"
+        f"📚 Предмет: **{matched_name}**\n"
         f"📅 Ближайший урок: **{weekday_ru}, {lesson_date.strftime('%d.%m')}**\n"
-        f"⏰ Бот пришлет его: **в этот же день ровно в 15:30**\n\n"
+        f"⏰ Отправка: **в этот же день в 15:30**\n\n"
         f"{final_text}"
     )
 
@@ -198,7 +219,7 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, parse_mode="Markdown")
 
-# Отправка в 15:30
+# --- Отправка в 15:30 ---
 async def send_daily():
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     async with aiosqlite.connect("school.db") as db:
@@ -211,7 +232,7 @@ async def send_daily():
             for row in rows:
                 text = (
                     f"🔔 **ДОМАШНЕЕ ЗАДАНИЕ НА СЕГОДНЯ**\n"
-                    f"📖 Предмет: **{row['subject'].capitalize()}**\n\n"
+                    f"📖 Предмет: **{row['subject']}**\n\n"
                     f"{row['task_text']}"
                 )
                 if row["photo_id"]:
@@ -222,12 +243,18 @@ async def send_daily():
                 await db.execute("UPDATE homework SET is_sent = 1 WHERE id = ?", (row["id"],))
             await db.commit()
 
+    # Обновляем бэкап после отправки
+    await sync_backup()
+
 async def main():
     await init_db()
     await start_web_server()
+    await restore_from_backup()
+    
     scheduler.add_job(send_daily, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
-    print("Бот успешно запущен!")
+    
+    print("Бот 8-Б класса успешно запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
