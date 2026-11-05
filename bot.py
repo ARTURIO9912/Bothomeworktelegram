@@ -22,7 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws"
 ADMIN_CHAT_ID = 6243658367
-GROQ_API_KEY = "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"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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").strip()
 
 SEND_HOUR = 15
 SEND_MINUTE = 30
@@ -127,56 +127,49 @@ async def restore_from_backup():
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
-async def fix_existing_dates():
-    async with aiosqlite.connect("school.db") as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT id, subject FROM homework WHERE is_sent = 0") as cursor:
-            rows = await cursor.fetchall()
-            for r in rows:
-                lesson_d, _ = find_next_lesson_date(r["subject"])
-                if lesson_d:
-                    reminder_d = lesson_d - timedelta(days=1)
-                    await db.execute(
-                        "UPDATE homework SET send_date = ? WHERE id = ?",
-                        (reminder_d.strftime("%Y-%m-%d"), r["id"])
-                    )
-        await db.commit()
-    await sync_backup()
-
 async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "") -> str:
-    instruction_part = f"Дополнительное указание от ученика: {user_instruction}" if user_instruction else "Сделай текст аккуратным, понятным и структурированным."
+    key = GROQ_API_KEY
+    if not key:
+        return f"{raw_task}\n\n<i>(⚠️ Не указан GROQ_API_KEY)</i>"
 
-    prompt = f"""Ты помощник старосты школьного класса.
-Твоя задача — оформить черновик домашнего задания.
+    user_note = f"\nПожелание ученика: {user_instruction}" if user_instruction else ""
+
+    prompt = f"""Ты помощник старосты школьного класса. Перепиши черновик домашнего задания так, чтобы оно было аккуратным, понятным и готовым для отправки в беседу класса.
 
 Предмет: {subject}
-Черновик задания: {raw_task}
-{instruction_part}
+Черновик: {raw_task}{user_note}
 
 Правила:
-1. Исправь грамматические и пунктуационные ошибки, оформи красиво.
-2. СТРОЖАЙШЕЕ ПРАВИЛО: Не изменяй, не перефразируй и не сокращай названия тем, термины и цитаты. Если написано "объяснить смысл темы X", само название темы X должно остаться точно в таком виде, как написал автор.
-3. Если в задании чего-то явно не хватает для понимания (например: сказано перевести текст, но нет страницы; сказано сделать номер, но нет номера упражнения), напиши в самом конце отдельной строкой:
-⚠️ Вопрос для уточнения: [напиши, что именно нужно уточнить]
-4. Выведи только готовый итоговый текст задания без вступительных слов.
+1. Исправь все орфографические и пунктуационные ошибки.
+2. Оформи аккуратным нумерованным списком (1, 2, 3), если пунктов несколько.
+3. ВАЖНО: Ни в коем случае не меняй, не сокращай и не искажай названия тем, формулировки терминов и цитаты. Если написано "объяснить смысл темы Х", название темы Х должно остаться точным, слово в слово.
+4. Если не хватает важных деталей (например, не указана страница текста или номер упражнения), добавь в конце отдельной строкой:
+⚠️ Вопрос для уточнения: [что нужно уточнить]
+5. Выведи ТОЛЬКО готовый текст домашнего задания без вступительных слов и без лишних пустых фраз.
 """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json"
+                },
                 json={
                     "model": "llama-3.3-70b-versatile",
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2
+                    "temperature": 0.5
                 }
             )
             if resp.status_code == 200:
                 result = resp.json()
                 return result["choices"][0]["message"]["content"].strip()
+            else:
+                logging.error(f"Groq API Error {resp.status_code}: {resp.text}")
+                return f"{raw_task}\n\n<i>(⚠️ Ошибка Groq {resp.status_code}: ключ отозван или неверен)</i>"
     except Exception as e:
         logging.error(f"Ошибка вызова ИИ: {e}")
-    return raw_task
+        return f"{raw_task}\n\n<i>(⚠️ Ошибка соединения с ИИ: {e})</i>"
 
 def normalize_subject(name: str) -> str:
     s = name.strip().lower()
@@ -295,15 +288,13 @@ async def view_homework_cmd(msg: Message):
         send_weekday = DAYS_MAP[send_date_obj.weekday()].capitalize()
         lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
-        escaped_task = html.escape(row["task_text"])
-
         card_text = (
             f"📌 <b>Задание {idx} из {total}</b>\n"
             f"📚 Предмет: <b>{html.escape(row['subject'])}</b>\n"
             f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
             f"⏰ Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
             f"📝 <b>Что задано:</b>\n"
-            f"<blockquote>{escaped_task}</blockquote>"
+            f"<blockquote>{row['task_text']}</blockquote>"
         )
 
         kb = make_hw_kb(row["id"])
@@ -396,10 +387,9 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
     await sync_backup()
     await state.clear()
 
-    escaped_better = html.escape(better_text)
     await msg.answer(
         f"✅ <b>ИИ успешно переписал задание!</b>\n\n"
-        f"📝 <b>Результат:</b>\n<blockquote>{escaped_better}</blockquote>",
+        f"📝 <b>Результат:</b>\n<blockquote>{better_text}</blockquote>",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -501,7 +491,6 @@ async def handle_homework(msg: Message):
 
     send_weekday = DAYS_MAP[reminder_date.weekday()].capitalize()
     lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
-    escaped_task = html.escape(final_text)
     
     confirm = (
         f"✅ <b>Задание успешно сохранено!</b>\n\n"
@@ -509,7 +498,7 @@ async def handle_homework(msg: Message):
         f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
         f"⏰ Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
         f"📝 <b>Что будет отправлено:</b>\n"
-        f"<blockquote>{escaped_task}</blockquote>"
+        f"<blockquote>{final_text}</blockquote>"
     )
 
     kb = make_hw_kb(hw_id)
@@ -518,24 +507,21 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
-# Функция отправки готовых и пропущенных заданий
 async def send_due_homework() -> int:
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     sent_count = 0
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
-        # Находим всё, дата отправки чего уже наступила (сегодня или раньше) и еще не отправлено
         async with db.execute(
             "SELECT id, subject, task_text, photo_id FROM homework WHERE send_date <= ? AND is_sent = 0",
             (today_str,)
         ) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
-                escaped_task = html.escape(row['task_text'])
                 text = (
                     f"🔔 <b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
                     f"📖 Предмет: <b>{html.escape(row['subject'])}</b>\n\n"
-                    f"<blockquote>{escaped_task}</blockquote>\n\n"
+                    f"<blockquote>{row['task_text']}</blockquote>\n\n"
                     f"<i>(Перешли это сообщение в группу класса)</i>"
                 )
                 try:
@@ -555,7 +541,6 @@ async def send_due_homework() -> int:
         await sync_backup()
     return sent_count
 
-# Ручная отправка по кнопке или команде /send
 @dp.message(F.text == "⚡️ Отправить сейчас")
 @dp.message(Command("send"))
 async def manual_send_cmd(msg: Message):
@@ -571,16 +556,12 @@ async def main():
     await init_db()
     await start_web_server()
     await restore_from_backup()
-    await fix_existing_dates()
     
-    # Регулярный запуск каждый день в 15:30
     scheduler.add_job(send_due_homework, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
     
-    # АВТОДОСЫЛ: если бот включился позже 15:30, сразу отправляем всё пропущенное
     now = datetime.now()
     if now.hour > SEND_HOUR or (now.hour == SEND_HOUR and now.minute >= SEND_MINUTE):
-        print("Бот проснулся позже 15:30, досылаем пропущенное ДЗ...")
         await send_due_homework()
 
     print("Бот 8-Б класса запущен.")
