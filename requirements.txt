@@ -2,3 +2,4 @@ aiogram
 apscheduler
 aiosqlite
 aiohttp
+httpx
