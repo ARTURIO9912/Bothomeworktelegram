@@ -7,7 +7,11 @@ import aiosqlite
 import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, 
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
+)
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,7 +27,6 @@ SEND_HOUR = 15
 SEND_MINUTE = 30
 PORT = int(os.environ.get("PORT", 10000))
 
-# Расписание 8-Б класса
 SCHEDULE = {
     0: ["рум. яз.", "англ. яз.", "история", "математика", "физика", "география", "информ."],
     1: ["муз. восп.", "рум. яз.", "история", "болг. яз.", "гв", "рус. яз.", "англ. яз."],
@@ -43,9 +46,22 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone="Europe/Chisinau")
 
+# Постоянная клавиатура с кнопками внизу экрана
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")],
+        [KeyboardButton(text="❌ Отмена")]
+    ],
+    resize_keyboard=True
+)
+
 class EditHW(StatesGroup):
     waiting_for_text = State()
     waiting_for_subject = State()
+
+def to_quote(text: str) -> str:
+    lines = text.strip().split("\n")
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in lines)
 
 async def web_handle(request):
     return web.Response(text="Bot is running!")
@@ -79,7 +95,7 @@ async def sync_backup():
             rows = await cursor.fetchall()
             data = [dict(row) for row in rows]
 
-    backup_text = f"BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
+    backup_text = f"📦 BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
     try:
         chat = await bot.get_chat(ADMIN_CHAT_ID)
         pinned = chat.pinned_message
@@ -125,8 +141,8 @@ async def improve_with_ai(subject: str, raw_task: str) -> str:
 1. Исправь грамматические и пунктуационные ошибки, оформи пункты понятно.
 2. СТРОЖАЙШЕЕ ПРАВИЛО: Не изменяй, не перефразируй и не сокращай названия тем, термины и цитаты. Если написано "объяснить смысл темы X", само название темы X должно остаться точно в таком виде, как написал автор.
 3. Если в задании чего-то явно не хватает для понимания (например: сказано перевести текст, но нет страницы; сказано сделать номер, но нет номера упражнения), напиши в самом конце отдельной строкой:
-Вопрос для уточнения: [напиши, что именно нужно уточнить]
-4. Ни в коем случае не используй смайлики и эмодзи.
+⚠️ Вопрос для уточнения: [напиши, что именно нужно уточнить]
+4. Сделай текст читаемым и красивым.
 5. Выведи только готовый итоговый текст задания без вступительных фраз.
 """
     try:
@@ -188,9 +204,9 @@ def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[
 def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Удалить", callback_data=f"del_hw:{hw_id}"),
-            InlineKeyboardButton(text="Изменить текст", callback_data=f"edit_text:{hw_id}"),
-            InlineKeyboardButton(text="Изменить предмет", callback_data=f"edit_subj:{hw_id}")
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_hw:{hw_id}"),
+            InlineKeyboardButton(text="✏️ Текст", callback_data=f"edit_text:{hw_id}"),
+            InlineKeyboardButton(text="🔄 Предмет", callback_data=f"edit_subj:{hw_id}")
         ]
     ])
 
@@ -199,39 +215,48 @@ async def start_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     await msg.answer(
-        "Бот 8-Б класса готов к работе.\n\n"
-        "Команды:\n"
-        "/dz — список всех сохраненных заданий (можно удалить или изменить)\n"
-        "/расписание — расписание уроков на неделю\n"
-        "/cancel — отмена текущего действия\n\n"
-        "Отправка заданий:\n"
-        "- Фото доски: фото с названием предмета в подписи (например: Литература или Химия: задачи 1 и 2)\n"
-        "- Текстом: Литература: объяснить смысл темы 'Понятие о чести'"
+        "👋 **Бот 8-Б класса готов к работе!**\n\n"
+        "Управляй ботом с помощью кнопок снизу клавиатуры:\n"
+        "• **📚 Список ДЗ** — посмотреть задания, удалить или изменить\n"
+        "• **📅 Расписание** — узнать уроки на неделю\n"
+        "• **❌ Отмена** — сбросить редактирование\n\n"
+        "📝 **Как отправить задание на перемене:**\n"
+        "• Текстом: `Румынский: выучить слова на стр 15`\n"
+        "• Фото с доски: прикрепи фото, а в подписи напиши предмет (например, `Химия` или `Химия: упр 2`)",
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown"
     )
 
+# Отмена действия через кнопку или команду
+@dp.message(F.text == "❌ Отмена")
 @dp.message(Command("cancel"))
 async def cancel_fsm(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     current_state = await state.get_state()
     if current_state is None:
-        await msg.answer("Нет активных действий для отмены.")
+        await msg.answer("👌 Нет активных действий для отмены.", reply_markup=MAIN_KEYBOARD)
         return
     await state.clear()
-    await msg.answer("Действие отменено.")
+    await msg.answer("❌ Действие отменено.", reply_markup=MAIN_KEYBOARD)
 
+# Просмотр расписания
+@dp.message(F.text == "📅 Расписание")
 @dp.message(Command("расписание"))
 async def view_schedule_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
-    lines = ["Расписание 8-Б класса:"]
+    lines = ["📅 **Расписание 8-Б класса:**\n"]
     for day_idx in range(5):
         day_name = DAYS_MAP[day_idx].capitalize()
-        lines.append(f"\n{day_name}:")
+        lines.append(f"🔹 **{day_name}:**")
         for num, subj in enumerate(SCHEDULE[day_idx], start=1):
             lines.append(f"  {num}. {subj.capitalize()}")
-    await msg.answer("\n".join(lines))
+        lines.append("")
+    await msg.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
 
+# Просмотр всех сохраненных ДЗ (с динамической нумерацией 1 из N, днями недели и цитированием)
+@dp.message(F.text == "📚 Список ДЗ")
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -244,23 +269,34 @@ async def view_homework_cmd(msg: Message):
             rows = await cursor.fetchall()
 
     if not rows:
-        await msg.answer("Активных сохраненных заданий нет.")
+        await msg.answer("📭 Активных сохраненных заданий нет. В очереди пусто!", reply_markup=MAIN_KEYBOARD)
         return
 
-    await msg.answer(f"Всего заданий в очереди: {len(rows)}")
-    for row in rows:
-        text = (
-            f"Задание #{row['id']}\n"
-            f"Предмет: {row['subject']}\n"
-            f"Дата отправки: {row['send_date']} в 15:30\n"
-            f"Содержание:\n{row['task_text']}"
+    total = len(rows)
+    await msg.answer(f"📋 **В очереди заданий: {total}**\nНиже карточки каждого урока:", reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+
+    for idx, row in enumerate(rows, start=1):
+        target_date = datetime.strptime(row["send_date"], "%Y-%m-%d").date()
+        weekday_name = DAYS_MAP[target_date.weekday()].capitalize()
+        formatted_date = f"{weekday_name}, {target_date.strftime('%d.%m')}"
+
+        quoted_task = to_quote(row["task_text"])
+
+        card_text = (
+            f"📌 **Задание {idx} из {total}**\n"
+            f"📚 Предмет: **{row['subject']}**\n"
+            f"📅 Отправка: **{formatted_date} в 15:30**\n\n"
+            f"📝 **Что задано:**\n"
+            f"{quoted_task}"
         )
+
         kb = make_hw_kb(row["id"])
         if row["photo_id"]:
-            await msg.answer_photo(photo=row["photo_id"], caption=text, reply_markup=kb)
+            await msg.answer_photo(photo=row["photo_id"], caption=card_text, reply_markup=kb, parse_mode="Markdown")
         else:
-            await msg.answer(text=text, reply_markup=kb)
+            await msg.answer(text=card_text, reply_markup=kb, parse_mode="Markdown")
 
+# Удаление ДЗ
 @dp.callback_query(F.data.startswith("del_hw:"))
 async def delete_hw_callback(call: CallbackQuery):
     hw_id = int(call.data.split(":")[1])
@@ -268,31 +304,33 @@ async def delete_hw_callback(call: CallbackQuery):
         await db.execute("DELETE FROM homework WHERE id = ?", (hw_id,))
         await db.commit()
     await sync_backup()
-    await call.answer("Задание удалено.")
-    del_text = f"Задание #{hw_id} удалено."
+    await call.answer("🗑 Задание удалено.")
+    del_text = "🗑 **Задание успешно удалено из очереди.**\nЧтобы обновить нумерацию, нажми «📚 Список ДЗ»."
     if call.message.photo:
-        await call.message.edit_caption(caption=del_text)
+        await call.message.edit_caption(caption=del_text, parse_mode="Markdown")
     else:
-        await call.message.edit_text(text=del_text)
+        await call.message.edit_text(text=del_text, parse_mode="Markdown")
 
+# Изменение текста: запрос
 @dp.callback_query(F.data.startswith("edit_text:"))
 async def edit_text_start(call: CallbackQuery, state: FSMContext):
     hw_id = int(call.data.split(":")[1])
     await state.update_data(hw_id=hw_id)
     await state.set_state(EditHW.waiting_for_text)
     await call.answer()
-    await call.message.reply(f"Отправь новый текст задания для #{hw_id}.\nДля отмены напиши /cancel.")
+    await call.message.reply("✏️ **Отправь новый текст задания сообщением.**\nЕсли передумал, нажми кнопку «❌ Отмена».", parse_mode="Markdown")
 
+# Изменение текста: сохранение
 @dp.message(EditHW.waiting_for_text, F.from_user.id == ADMIN_CHAT_ID)
 async def edit_text_finish(msg: Message, state: FSMContext):
     new_text = msg.text or msg.caption or ""
     if not new_text:
-        await msg.answer("Текст не может быть пустым. Отправь новый текст или напиши /cancel.")
+        await msg.answer("⚠️ Текст не может быть пустым. Отправь текст задания заново.")
         return
     data = await state.get_data()
     hw_id = data["hw_id"]
 
-    wait_msg = await msg.answer("Обработка текста через ИИ...")
+    wait_msg = await msg.answer("🧠 ИИ обрабатывает новый текст...")
     async with aiosqlite.connect("school.db") as db:
         async with db.execute("SELECT subject FROM homework WHERE id = ?", (hw_id,)) as cursor:
             row = await cursor.fetchone()
@@ -306,22 +344,31 @@ async def edit_text_finish(msg: Message, state: FSMContext):
         await db.commit()
     await sync_backup()
     await state.clear()
-    await msg.answer(f"Текст задания #{hw_id} успешно обновлен на:\n{better_text}")
+    
+    quoted_new = to_quote(better_text)
+    await msg.answer(
+        f"✅ **Текст задания успешно обновлен!**\n\n"
+        f"📝 **Новая формулировка:**\n{quoted_new}",
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown"
+    )
 
+# Изменение предмета: запрос
 @dp.callback_query(F.data.startswith("edit_subj:"))
 async def edit_subj_start(call: CallbackQuery, state: FSMContext):
     hw_id = int(call.data.split(":")[1])
     await state.update_data(hw_id=hw_id)
     await state.set_state(EditHW.waiting_for_subject)
     await call.answer()
-    await call.message.reply(f"Отправь новое название предмета для #{hw_id}.\nДля отмены напиши /cancel.")
+    await call.message.reply("🔄 **Напиши новое название предмета.**\nЕсли передумал, нажми кнопку «❌ Отмена».", parse_mode="Markdown")
 
+# Изменение предмета: сохранение и пересчет даты
 @dp.message(EditHW.waiting_for_subject, F.from_user.id == ADMIN_CHAT_ID)
 async def edit_subj_finish(msg: Message, state: FSMContext):
     new_subj = (msg.text or "").strip()
     lesson_date, matched_name = find_next_lesson_date(new_subj)
     if not lesson_date:
-        await msg.answer(f"Предмет «{new_subj}» не найден в расписании. Попробуй еще раз или напиши /cancel.")
+        await msg.answer(f"❌ Предмет «{new_subj}» не найден в расписании 8-Б класса. Попробуй еще раз или нажми «❌ Отмена».")
         return
 
     data = await state.get_data()
@@ -339,10 +386,14 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
     await state.clear()
     weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
     await msg.answer(
-        f"Предмет для задания #{hw_id} изменен на: {matched_name}\n"
-        f"Новая дата отправки: {weekday_ru}, {lesson_date.strftime('%d.%m')} в 15:30"
+        f"✅ **Предмет успешно изменен!**\n\n"
+        f"📚 Новый предмет: **{matched_name}**\n"
+        f"📅 Новая дата отправки: **{weekday_ru}, {lesson_date.strftime('%d.%m')} в 15:30**",
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown"
     )
 
+# Прием нового задания
 @dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
     photo_id = None
@@ -352,7 +403,7 @@ async def handle_homework(msg: Message):
         photo_id = msg.photo[-1].file_id
         raw_text = (msg.caption or "").strip()
         if not raw_text:
-            await msg.answer("Ошибка: фото отправлено без названия предмета. Напиши предмет в подписи к фото.")
+            await msg.answer("⚠️ Ты отправил фото без названия предмета! Напиши предмет в подписи к фото (например: `Химия`).")
             return
     else:
         raw_text = (msg.text or "").strip()
@@ -365,20 +416,21 @@ async def handle_homework(msg: Message):
 
     lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(f"Предмет «{subject}» не найден в расписании 8-Б класса.")
+        await msg.answer(f"❌ Предмет «{subject}» не найден в расписании 8-Б класса. Проверь название в расписании!")
         return
 
+    # Обработка через ИИ
     if photo_id:
         if task:
-            wait_msg = await msg.answer("Обработка подписи к фото...")
+            wait_msg = await msg.answer("🧠 ИИ форматирует подпись...")
             refined_task = await improve_with_ai(matched_name, task)
             await wait_msg.delete()
-            final_text = f"Задание на фото с доски.\nПримечание: {refined_task}"
+            final_text = f"📸 Задание на фото с доски!\nПримечание: {refined_task}"
         else:
-            final_text = "Задание на фото с доски."
+            final_text = "📸 Задание на фото с доски 👆"
     else:
-        wait_msg = await msg.answer("Обработка текста через ИИ...")
-        final_text = await improve_with_ai(matched_name, task if task else "Смотри задание")
+        wait_msg = await msg.answer("🧠 ИИ делает текст понятнее...")
+        final_text = await improve_with_ai(matched_name, task if task else "Смотри задание от учителя")
         await wait_msg.delete()
 
     send_date_str = lesson_date.strftime("%Y-%m-%d")
@@ -394,20 +446,24 @@ async def handle_homework(msg: Message):
     await sync_backup()
 
     weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
+    quoted_task = to_quote(final_text)
+    
     confirm = (
-        f"Задание #{hw_id} сохранено.\n\n"
-        f"Предмет: {matched_name}\n"
-        f"Ближайший урок: {weekday_ru}, {lesson_date.strftime('%d.%m')}\n"
-        f"Отправка: в день урока в 15:30\n\n"
-        f"Запись:\n{final_text}"
+        f"✅ **Задание успешно сохранено!**\n\n"
+        f"📚 Предмет: **{matched_name}**\n"
+        f"📅 Ближайший урок: **{weekday_ru}, {lesson_date.strftime('%d.%m')}**\n"
+        f"⏰ Отправка: **в этот же день в 15:30**\n\n"
+        f"📝 **Что будет отправлено:**\n"
+        f"{quoted_task}"
     )
 
     kb = make_hw_kb(hw_id)
     if photo_id:
-        await msg.answer_photo(photo=photo_id, caption=confirm, reply_markup=kb)
+        await msg.answer_photo(photo=photo_id, caption=confirm, reply_markup=kb, parse_mode="Markdown")
     else:
-        await msg.answer(confirm, reply_markup=kb)
+        await msg.answer(confirm, reply_markup=kb, parse_mode="Markdown")
 
+# Ежедневная отправка в 15:30
 async def send_daily():
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     async with aiosqlite.connect("school.db") as db:
@@ -418,15 +474,17 @@ async def send_daily():
         ) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
+                quoted = to_quote(row['task_text'])
                 text = (
-                    f"ДОМАШНЕЕ ЗАДАНИЕ НА СЕГОДНЯ\n"
-                    f"Предмет: {row['subject']}\n\n"
-                    f"{row['task_text']}"
+                    f"🔔 **ДОМАШНЕЕ ЗАДАНИЕ НА СЕГОДНЯ**\n"
+                    f"📖 Предмет: **{row['subject']}**\n\n"
+                    f"{quoted}\n\n"
+                    f"*(Перешли это сообщение в группу класса)*"
                 )
                 if row["photo_id"]:
-                    await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text)
+                    await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="Markdown")
                 else:
-                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
 
                 await db.execute("UPDATE homework SET is_sent = 1 WHERE id = ?", (row["id"],))
             await db.commit()
