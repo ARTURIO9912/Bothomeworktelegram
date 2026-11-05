@@ -86,9 +86,12 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
-        # Очищаем старые эмодзи из текста в базе, если они остались
+        # Убираем старые эмодзи из текста
         await db.execute("UPDATE homework SET task_text = REPLACE(task_text, '📸 ', '')")
         await db.execute("UPDATE homework SET task_text = REPLACE(task_text, ' 👆', '')")
+        # Сбрасываем флаг отправки для сегодняшних заданий, чтобы их можно было отправить снова
+        now_str = datetime.now(TZ).strftime("%Y-%m-%d")
+        await db.execute("UPDATE homework SET is_sent = 0 WHERE send_date = ?", (now_str,))
         await db.commit()
 
 async def sync_backup():
@@ -192,7 +195,6 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
     except Exception as e:
         logging.error(f"Ошибка вызова ИИ: {e}")
 
-    # При любой ошибке просто возвращаем исходный текст без мусорных сообщений
     return raw_task
 
 def normalize_subject(name: str) -> str:
@@ -235,6 +237,9 @@ def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[
 
 def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Отправить в чат сейчас", callback_data=f"send_one:{hw_id}")
+        ],
         [
             InlineKeyboardButton(text="Удалить", callback_data=f"del_hw:{hw_id}"),
             InlineKeyboardButton(text="Свой текст", callback_data=f"edit_text:{hw_id}")
@@ -296,7 +301,7 @@ async def view_homework_cmd(msg: Message):
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC"
+            "SELECT id, subject, task_text, photo_id, send_date FROM homework ORDER BY send_date ASC"
         ) as cursor:
             rows = await cursor.fetchall()
 
@@ -314,13 +319,15 @@ async def view_homework_cmd(msg: Message):
         send_weekday = DAYS_MAP[send_date_obj.weekday()].capitalize()
         lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
+        clean_text = row['task_text'].replace("📸 ", "").replace(" 👆", "")
+
         card_text = (
             f"Задание {idx} из {total}\n"
             f"Предмет: <b>{html.escape(row['subject'])}</b>\n"
             f"Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
             f"Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
             f"Текст:\n"
-            f"<blockquote>{row['task_text']}</blockquote>"
+            f"<blockquote>{clean_text}</blockquote>"
         )
 
         kb = make_hw_kb(row["id"])
@@ -328,6 +335,33 @@ async def view_homework_cmd(msg: Message):
             await msg.answer_photo(photo=row["photo_id"], caption=card_text, reply_markup=kb, parse_mode="HTML")
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
+
+# Отправка одного конкретного задания по кнопке прямо из карточки
+@dp.callback_query(F.data.startswith("send_one:"))
+async def send_one_callback(call: CallbackQuery):
+    hw_id = int(call.data.split(":")[1])
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT subject, task_text, photo_id FROM homework WHERE id = ?", (hw_id,)) as cursor:
+            row = await cursor.fetchone()
+
+    if not row:
+        await call.answer("Задание не найдено.")
+        return
+
+    clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
+    text = (
+        f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
+        f"<b>Предмет:</b> {html.escape(row['subject'])}\n\n"
+        f"<blockquote>{clean_task}</blockquote>"
+    )
+
+    if row["photo_id"]:
+        await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="HTML")
+    else:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="HTML")
+
+    await call.answer("Отправлено в чат!")
 
 @dp.callback_query(F.data.startswith("del_hw:"))
 async def delete_hw_callback(call: CallbackQuery):
@@ -529,17 +563,19 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
-# Отправка без смайликов и без подсказок
-async def send_due_homework() -> int:
+async def send_due_homework(force_resend: bool = False) -> int:
     now_md = datetime.now(TZ)
     today_str = now_md.strftime("%Y-%m-%d")
     sent_count = 0
+
+    query = "SELECT id, subject, task_text, photo_id FROM homework WHERE send_date <= ?"
+    if not force_resend:
+        query += " AND is_sent = 0"
+    query += " ORDER BY id DESC"
+
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id, subject, task_text, photo_id FROM homework WHERE send_date <= ? AND is_sent = 0",
-            (today_str,)
-        ) as cursor:
+        async with db.execute(query, (today_str,)) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
                 clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
@@ -565,14 +601,20 @@ async def send_due_homework() -> int:
         await sync_backup()
     return sent_count
 
+# Кнопка «Отправить сейчас» принудительно отправляет всё актуальное за сегодня
 @dp.message(F.text == "Отправить сейчас")
 @dp.message(Command("send"))
 async def manual_send_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
-    count = await send_due_homework()
+    # Сначала пытаемся отправить неотправленные
+    count = await send_due_homework(force_resend=False)
+    # Если неотправленных не было, отправляем повторно сегодняшние
     if count == 0:
-        await msg.answer("Все актуальные задания уже отправлены, очереди нет.", reply_markup=MAIN_KEYBOARD)
+        count = await send_due_homework(force_resend=True)
+
+    if count == 0:
+        await msg.answer("В базе нет заданий на сегодня или ранее.", reply_markup=MAIN_KEYBOARD)
     else:
         await msg.answer(f"Отправлено заданий: {count}", reply_markup=MAIN_KEYBOARD)
 
@@ -587,7 +629,7 @@ async def main():
     
     now = datetime.now(TZ)
     if now.hour > SEND_HOUR or (now.hour == SEND_HOUR and now.minute >= SEND_MINUTE):
-        await send_due_homework()
+        await send_due_homework(force_resend=False)
 
     print("Бот 8-Б класса запущен.")
     await dp.start_polling(bot)
