@@ -23,9 +23,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws"
 ADMIN_CHAT_ID = 6243658367
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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").strip()
 
-# Часовой пояс Молдовы
 TZ = ZoneInfo("Europe/Chisinau")
 
 SEND_HOUR = 15
@@ -53,8 +52,8 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")],
-        [KeyboardButton(text="⚡️ Отправить сейчас"), KeyboardButton(text="❌ Отмена")]
+        [KeyboardButton(text="Список ДЗ"), KeyboardButton(text="Расписание")],
+        [KeyboardButton(text="Отправить сейчас"), KeyboardButton(text="Отмена")]
     ],
     resize_keyboard=True
 )
@@ -87,6 +86,9 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
+        # Очищаем старые эмодзи из текста в базе, если они остались
+        await db.execute("UPDATE homework SET task_text = REPLACE(task_text, '📸 ', '')")
+        await db.execute("UPDATE homework SET task_text = REPLACE(task_text, ' 👆', '')")
         await db.commit()
 
 async def sync_backup():
@@ -96,7 +98,7 @@ async def sync_backup():
             rows = await cursor.fetchall()
             data = [dict(row) for row in rows]
 
-    backup_text = f"📦 BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
+    backup_text = f"BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
     try:
         chat = await bot.get_chat(ADMIN_CHAT_ID)
         pinned = chat.pinned_message
@@ -117,6 +119,7 @@ async def restore_from_backup():
             data = json.loads(json_str)
             async with aiosqlite.connect("school.db") as db:
                 for item in data:
+                    clean_text = item["task_text"].replace("📸 ", "").replace(" 👆", "")
                     async with db.execute(
                         "SELECT id FROM homework WHERE id = ?",
                         (item.get("id"),)
@@ -124,14 +127,12 @@ async def restore_from_backup():
                         if not await cursor.fetchone():
                             await db.execute(
                                 "INSERT INTO homework (id, subject, task_text, photo_id, send_date) VALUES (?, ?, ?, ?, ?)",
-                                (item.get("id"), item["subject"], item["task_text"], item["photo_id"], item["send_date"])
+                                (item.get("id"), item["subject"], clean_text, item["photo_id"], item["send_date"])
                             )
                 await db.commit()
-            print("База восстановлена из резервной копии.")
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
-# Принудительно выставляет даты отправки НАКАНУНЕ уроков
 async def fix_all_dates():
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
@@ -147,16 +148,15 @@ async def fix_all_dates():
                     )
         await db.commit()
     await sync_backup()
-    print("Все даты скорректированы на день накануне урока!")
 
 async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "") -> str:
-    key = GROQ_API_KEY
+    key = os.environ.get("GROQ_API_KEY", "").strip() or GROQ_API_KEY
     if not key:
-        return f"{raw_task}\n\n<i>(⚠️ Не указан GROQ_API_KEY в Environment на Render)</i>"
+        return raw_task
 
-    user_note = f"\nПожелание ученика: {user_instruction}" if user_instruction else ""
+    user_note = f"\nПожелание: {user_instruction}" if user_instruction else ""
 
-    prompt = f"""Ты школьный помощник. Перепиши черновик домашнего задания так, чтобы оно было аккуратным, понятным и удобным для чтения в группе класса.
+    prompt = f"""Ты школьный помощник. Перепиши черновик домашнего задания так, чтобы оно было аккуратным, понятным и готовым для отправки в беседу класса.
 
 Предмет: {subject}
 Черновик: {raw_task}{user_note}
@@ -164,10 +164,11 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
 Инструкция:
 1. Исправь орфографические и пунктуационные ошибки.
 2. Оформи нумерованным списком (1, 2, 3), если пунктов несколько.
-3. ВАЖНО: Не изменяй и не сокращай названия тем, термины и цитаты. Если написано "объяснить смысл темы Х", название темы Х должно остаться точным.
+3. ВАЖНО: Не изменяй и не сокращай названия тем, термины и цитаты. Если написано "объяснить смысл темы Х", название темы Х должно остаться точным, слово в слово.
 4. Если не хватает деталей (нет номера упражнения или страницы), добавь в конце:
-⚠️ Вопрос для уточнения: [что нужно уточнить]
-5. Выведи ТОЛЬКО готовый текст домашнего задания без вступительных слов.
+Вопрос для уточнения: [что нужно уточнить]
+5. СТРОЖАЙШЕЕ ПРАВИЛО: Не используй смайлики и эмодзи.
+6. Выведи ТОЛЬКО готовый текст домашнего задания без вступительных слов.
 """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -180,7 +181,7 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
                 json={
                     "model": "llama-3.3-70b-versatile",
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.5
+                    "temperature": 0.3
                 }
             )
             if resp.status_code == 200:
@@ -188,10 +189,11 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
                 return result["choices"][0]["message"]["content"].strip()
             else:
                 logging.error(f"Groq API Error {resp.status_code}: {resp.text}")
-                return f"{raw_task}\n\n<i>(⚠️ Ошибка Groq {resp.status_code})</i>"
     except Exception as e:
         logging.error(f"Ошибка вызова ИИ: {e}")
-        return f"{raw_task}\n\n<i>(⚠️ Ошибка соединения с ИИ: {e})</i>"
+
+    # При любой ошибке просто возвращаем исходный текст без мусорных сообщений
+    return raw_task
 
 def normalize_subject(name: str) -> str:
     s = name.strip().lower()
@@ -234,12 +236,12 @@ def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[
 def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_hw:{hw_id}"),
-            InlineKeyboardButton(text="✏️ Свой текст", callback_data=f"edit_text:{hw_id}")
+            InlineKeyboardButton(text="Удалить", callback_data=f"del_hw:{hw_id}"),
+            InlineKeyboardButton(text="Свой текст", callback_data=f"edit_text:{hw_id}")
         ],
         [
-            InlineKeyboardButton(text="🤖 Попросить ИИ переписать", callback_data=f"ai_edit:{hw_id}"),
-            InlineKeyboardButton(text="🔄 Сменить предмет", callback_data=f"edit_subj:{hw_id}")
+            InlineKeyboardButton(text="Переписать через ИИ", callback_data=f"ai_edit:{hw_id}"),
+            InlineKeyboardButton(text="Сменить предмет", callback_data=f"edit_subj:{hw_id}")
         ]
     ])
 
@@ -248,43 +250,45 @@ async def start_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     await msg.answer(
-        "👋 <b>Бот 8-Б класса готов к работе!</b>\n\n"
-        "Управляй ботом через кнопки снизу:\n"
-        "• <b>📚 Список ДЗ</b> — просмотр всех заданий\n"
-        "• <b>📅 Расписание</b> — уроки на неделю\n"
-        "• <b>⚡️ Отправить сейчас</b> — отправить все готовые ДЗ прямо сейчас\n"
-        "• <b>❌ Отмена</b> — сбросить редактирование",
-        reply_markup=MAIN_KEYBOARD,
-        parse_mode="HTML"
+        "Бот 8-Б класса готов к работе.\n\n"
+        "Кнопки снизу:\n"
+        "• Список ДЗ — просмотр заданий в очереди\n"
+        "• Расписание — уроки на неделю\n"
+        "• Отправить сейчас — выгрузить задания прямо сейчас\n"
+        "• Отмена — сбросить редактирование\n\n"
+        "Отправка заданий на перемене:\n"
+        "• Текстом: Румынский: выучить слова на стр 15\n"
+        "• Фото с доски: прикрепи фото с названием предмета (например, Химия)",
+        reply_markup=MAIN_KEYBOARD
     )
 
-@dp.message(F.text == "❌ Отмена")
+@dp.message(F.text == "Отмена")
 @dp.message(Command("cancel"))
 async def cancel_fsm(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     current_state = await state.get_state()
     if current_state is None:
-        await msg.answer("👌 Нет активных действий для отмены.", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+        await msg.answer("Нет активных действий для отмены.", reply_markup=MAIN_KEYBOARD)
         return
     await state.clear()
-    await msg.answer("❌ Действие отменено.", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+    await msg.answer("Действие отменено.", reply_markup=MAIN_KEYBOARD)
 
-@dp.message(F.text == "📅 Расписание")
+@dp.message(F.text == "Расписание")
 @dp.message(Command("расписание"))
 async def view_schedule_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
-    lines = ["📅 <b>Расписание 8-Б класса:</b>\n"]
+    lines = ["Расписание 8-Б класса:\n"]
     for day_idx in range(5):
         day_name = DAYS_MAP[day_idx].capitalize()
-        lines.append(f"🔹 <b>{day_name}:</b>")
+        lines.append(f"{day_name}:")
         for num, subj in enumerate(SCHEDULE[day_idx], start=1):
             lines.append(f"  {num}. {html.escape(subj.capitalize())}")
         lines.append("")
     await msg.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
 
-@dp.message(F.text == "📚 Список ДЗ")
+@dp.message(F.text == "Список ДЗ")
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -297,11 +301,11 @@ async def view_homework_cmd(msg: Message):
             rows = await cursor.fetchall()
 
     if not rows:
-        await msg.answer("📭 Активных сохраненных заданий нет. В очереди пусто!", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+        await msg.answer("Активных заданий нет. В очереди пусто.", reply_markup=MAIN_KEYBOARD)
         return
 
     total = len(rows)
-    await msg.answer(f"📋 <b>В очереди заданий: {total}</b>\nНиже карточки каждого урока:", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+    await msg.answer(f"В очереди заданий: {total}", reply_markup=MAIN_KEYBOARD)
 
     for idx, row in enumerate(rows, start=1):
         send_date_obj = datetime.strptime(row["send_date"], "%Y-%m-%d").date()
@@ -311,11 +315,11 @@ async def view_homework_cmd(msg: Message):
         lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
         card_text = (
-            f"📌 <b>Задание {idx} из {total}</b>\n"
-            f"📚 Предмет: <b>{html.escape(row['subject'])}</b>\n"
-            f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
-            f"⏰ Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
-            f"📝 <b>Что задано:</b>\n"
+            f"Задание {idx} из {total}\n"
+            f"Предмет: <b>{html.escape(row['subject'])}</b>\n"
+            f"Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
+            f"Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
+            f"Текст:\n"
             f"<blockquote>{row['task_text']}</blockquote>"
         )
 
@@ -332,12 +336,12 @@ async def delete_hw_callback(call: CallbackQuery):
         await db.execute("DELETE FROM homework WHERE id = ?", (hw_id,))
         await db.commit()
     await sync_backup()
-    await call.answer("🗑 Задание удалено.")
-    del_text = "🗑 <b>Задание успешно удалено из очереди.</b>\nЧтобы увидеть обновленный список, нажми «📚 Список ДЗ»."
+    await call.answer("Задание удалено.")
+    del_text = "Задание удалено из очереди."
     if call.message.photo:
-        await call.message.edit_caption(caption=del_text, parse_mode="HTML")
+        await call.message.edit_caption(caption=del_text)
     else:
-        await call.message.edit_text(text=del_text, parse_mode="HTML")
+        await call.message.edit_text(text=del_text)
 
 @dp.callback_query(F.data.startswith("edit_text:"))
 async def edit_text_start(call: CallbackQuery, state: FSMContext):
@@ -345,13 +349,13 @@ async def edit_text_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(hw_id=hw_id)
     await state.set_state(EditHW.waiting_for_text)
     await call.answer()
-    await call.message.reply("✏️ <b>Отправь свой новый текст задания сообщением.</b>\nЕсли передумал, нажми «❌ Отмена».", parse_mode="HTML")
+    await call.message.reply("Отправь новый текст задания. Для отмены нажми «Отмена».")
 
 @dp.message(EditHW.waiting_for_text, F.from_user.id == ADMIN_CHAT_ID)
 async def edit_text_finish(msg: Message, state: FSMContext):
     new_text = msg.text or msg.caption or ""
     if not new_text:
-        await msg.answer("⚠️ Текст не может быть пустым. Отправь текст задания заново.", parse_mode="HTML")
+        await msg.answer("Текст не может быть пустым. Отправь текст задания заново.")
         return
     data = await state.get_data()
     hw_id = data["hw_id"]
@@ -364,8 +368,7 @@ async def edit_text_finish(msg: Message, state: FSMContext):
     
     escaped_new = html.escape(new_text)
     await msg.answer(
-        f"✅ <b>Текст задания успешно обновлен!</b>\n\n"
-        f"📝 <b>Новая формулировка:</b>\n<blockquote>{escaped_new}</blockquote>",
+        f"Текст задания обновлен:\n<blockquote>{escaped_new}</blockquote>",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -377,11 +380,10 @@ async def ai_edit_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(EditHW.waiting_for_ai_prompt)
     await call.answer()
     await call.message.reply(
-        "🤖 <b>Редактирование с помощью ИИ:</b>\n\n"
-        "Напиши, что именно изменить (например: <i>«сделай короче»</i>, <i>«разбей на пункты 1, 2, 3»</i>).\n\n"
-        "Или просто отправь знак плюс <b>+</b>, чтобы ИИ автоматически переписал текст понятнее и красивее.\n\n"
-        "Для отмены нажми кнопку «❌ Отмена».",
-        parse_mode="HTML"
+        "Редактирование через ИИ:\n\n"
+        "Напиши, как изменить задание (например: «сделай короче», «разбей по пунктам»).\n"
+        "Или отправь знак плюс (+), чтобы ИИ переписал текст автоматически.\n"
+        "Для отмены нажми «Отмена»."
     )
 
 @dp.message(EditHW.waiting_for_ai_prompt, F.from_user.id == ADMIN_CHAT_ID)
@@ -393,7 +395,7 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
     data = await state.get_data()
     hw_id = data["hw_id"]
 
-    wait_msg = await msg.answer("🧠 ИИ переписывает задание...", parse_mode="HTML")
+    wait_msg = await msg.answer("ИИ переписывает задание...")
 
     async with aiosqlite.connect("school.db") as db:
         async with db.execute("SELECT subject, task_text FROM homework WHERE id = ?", (hw_id,)) as cursor:
@@ -410,8 +412,7 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
     await state.clear()
 
     await msg.answer(
-        f"✅ <b>ИИ успешно переписал задание!</b>\n\n"
-        f"📝 <b>Результат:</b>\n<blockquote>{better_text}</blockquote>",
+        f"Результат:\n<blockquote>{better_text}</blockquote>",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -422,14 +423,14 @@ async def edit_subj_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(hw_id=hw_id)
     await state.set_state(EditHW.waiting_for_subject)
     await call.answer()
-    await call.message.reply("🔄 <b>Напиши новое название предмета.</b>\nЕсли передумал, нажми кнопку «❌ Отмена».", parse_mode="HTML")
+    await call.message.reply("Напиши новое название предмета. Для отмены нажми «Отмена».")
 
 @dp.message(EditHW.waiting_for_subject, F.from_user.id == ADMIN_CHAT_ID)
 async def edit_subj_finish(msg: Message, state: FSMContext):
     new_subj = (msg.text or "").strip()
     lesson_date, matched_name = find_next_lesson_date(new_subj)
     if not lesson_date:
-        await msg.answer(f"❌ Предмет «{html.escape(new_subj)}» не найден в расписании 8-Б класса. Попробуй еще раз или нажми «❌ Отмена».", parse_mode="HTML")
+        await msg.answer(f"Предмет «{html.escape(new_subj)}» не найден в расписании 8-Б класса.", parse_mode="HTML")
         return
 
     reminder_date = lesson_date - timedelta(days=1)
@@ -452,10 +453,9 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
     lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
 
     await msg.answer(
-        f"✅ <b>Предмет успешно изменен!</b>\n\n"
-        f"📚 Новый предмет: <b>{html.escape(matched_name)}</b>\n"
-        f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
-        f"⏰ Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне)",
+        f"Предмет изменен на: <b>{html.escape(matched_name)}</b>\n"
+        f"Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
+        f"Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне)",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -469,7 +469,7 @@ async def handle_homework(msg: Message):
         photo_id = msg.photo[-1].file_id
         raw_text = (msg.caption or "").strip()
         if not raw_text:
-            await msg.answer("⚠️ Ты отправил фото без названия предмета! Напиши предмет в подписи к фото (например: <code>Химия</code>).", parse_mode="HTML")
+            await msg.answer("Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: Химия).")
             return
     else:
         raw_text = (msg.text or "").strip()
@@ -482,19 +482,19 @@ async def handle_homework(msg: Message):
 
     lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(f"❌ Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса. Проверь название в расписании!", parse_mode="HTML")
+        await msg.answer(f"Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", parse_mode="HTML")
         return
 
     if photo_id:
         if task:
-            wait_msg = await msg.answer("🧠 ИИ форматирует подпись к фото...", parse_mode="HTML")
+            wait_msg = await msg.answer("ИИ форматирует подпись к фото...")
             refined_task = await improve_with_ai(matched_name, task)
             await wait_msg.delete()
-            final_text = f"📸 Задание на фото с доски!\nПримечание: {refined_task}"
+            final_text = f"Задание на фото с доски.\nПримечание: {refined_task}"
         else:
-            final_text = "📸 Задание на фото с доски 👆"
+            final_text = "Задание на фото с доски."
     else:
-        wait_msg = await msg.answer("🧠 ИИ делает текст понятнее...", parse_mode="HTML")
+        wait_msg = await msg.answer("ИИ форматирует текст...")
         final_text = await improve_with_ai(matched_name, task if task else "Смотри задание от учителя")
         await wait_msg.delete()
 
@@ -515,11 +515,11 @@ async def handle_homework(msg: Message):
     lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
     
     confirm = (
-        f"✅ <b>Задание успешно сохранено!</b>\n\n"
-        f"📚 Предмет: <b>{html.escape(matched_name)}</b>\n"
-        f"📅 Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
-        f"⏰ Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
-        f"📝 <b>Что будет отправлено:</b>\n"
+        f"Задание сохранено.\n\n"
+        f"Предмет: <b>{html.escape(matched_name)}</b>\n"
+        f"Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
+        f"Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
+        f"Текст для отправки:\n"
         f"<blockquote>{final_text}</blockquote>"
     )
 
@@ -529,7 +529,7 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
-# Функция отправки
+# Отправка без смайликов и без подсказок
 async def send_due_homework() -> int:
     now_md = datetime.now(TZ)
     today_str = now_md.strftime("%Y-%m-%d")
@@ -542,11 +542,11 @@ async def send_due_homework() -> int:
         ) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
+                clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
                 text = (
-                    f"🔔 <b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
-                    f"📖 Предмет: <b>{html.escape(row['subject'])}</b>\n\n"
-                    f"<blockquote>{row['task_text']}</blockquote>\n\n"
-                    f"<i>(Перешли это сообщение в группу класса)</i>"
+                    f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
+                    f"<b>Предмет:</b> {html.escape(row['subject'])}\n\n"
+                    f"<blockquote>{clean_task}</blockquote>"
                 )
                 try:
                     if row["photo_id"]:
@@ -565,16 +565,16 @@ async def send_due_homework() -> int:
         await sync_backup()
     return sent_count
 
-@dp.message(F.text == "⚡️ Отправить сейчас")
+@dp.message(F.text == "Отправить сейчас")
 @dp.message(Command("send"))
 async def manual_send_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     count = await send_due_homework()
     if count == 0:
-        await msg.answer("👌 Все актуальные задания уже были отправлены, пропущенных нет.", reply_markup=MAIN_KEYBOARD)
+        await msg.answer("Все актуальные задания уже отправлены, очереди нет.", reply_markup=MAIN_KEYBOARD)
     else:
-        await msg.answer(f"✅ Успешно отправлено заданий: {count}!", reply_markup=MAIN_KEYBOARD)
+        await msg.answer(f"Отправлено заданий: {count}", reply_markup=MAIN_KEYBOARD)
 
 async def main():
     await init_db()
@@ -585,10 +585,8 @@ async def main():
     scheduler.add_job(send_due_homework, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
     
-    # Проверяем точное время Молдовы
     now = datetime.now(TZ)
     if now.hour > SEND_HOUR or (now.hour == SEND_HOUR and now.minute >= SEND_MINUTE):
-        print("Текущее время больше 15:30, отправляем ДЗ...")
         await send_due_homework()
 
     print("Бот 8-Б класса запущен.")
