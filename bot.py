@@ -86,12 +86,8 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
-        # Убираем старые эмодзи из текста
         await db.execute("UPDATE homework SET task_text = REPLACE(task_text, '📸 ', '')")
         await db.execute("UPDATE homework SET task_text = REPLACE(task_text, ' 👆', '')")
-        # Сбрасываем флаг отправки для сегодняшних заданий, чтобы их можно было отправить снова
-        now_str = datetime.now(TZ).strftime("%Y-%m-%d")
-        await db.execute("UPDATE homework SET is_sent = 0 WHERE send_date = ?", (now_str,))
         await db.commit()
 
 async def sync_backup():
@@ -256,18 +252,19 @@ async def start_cmd(msg: Message):
         return
     await msg.answer(
         "Бот 8-Б класса готов к работе.\n\n"
-        "Кнопки снизу:\n"
-        "• Список ДЗ — просмотр заданий в очереди\n"
+        "Кнопки меню:\n"
+        "• Список ДЗ — просмотр очереди заданий\n"
         "• Расписание — уроки на неделю\n"
-        "• Отправить сейчас — выгрузить задания прямо сейчас\n"
+        "• Отправить сейчас — принудительно выгрузить ДЗ прямо сейчас\n"
         "• Отмена — сбросить редактирование\n\n"
-        "Отправка заданий на перемене:\n"
+        "Отправка заданий:\n"
         "• Текстом: Румынский: выучить слова на стр 15\n"
-        "• Фото с доски: прикрепи фото с названием предмета (например, Химия)",
+        "• Фото с доски: фото с названием предмета (например, Химия)",
         reply_markup=MAIN_KEYBOARD
     )
 
-@dp.message(F.text == "Отмена")
+# Обработка отмены (со смайликом и без)
+@dp.message(F.text.in_(["Отмена", "❌ Отмена"]))
 @dp.message(Command("cancel"))
 async def cancel_fsm(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -279,7 +276,8 @@ async def cancel_fsm(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Действие отменено.", reply_markup=MAIN_KEYBOARD)
 
-@dp.message(F.text == "Расписание")
+# Обработка расписания (со смайликом и без)
+@dp.message(F.text.in_(["Расписание", "📅 Расписание"]))
 @dp.message(Command("расписание"))
 async def view_schedule_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -293,7 +291,8 @@ async def view_schedule_cmd(msg: Message):
         lines.append("")
     await msg.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
 
-@dp.message(F.text == "Список ДЗ")
+# Обработка Списка ДЗ (со смайликом и без)
+@dp.message(F.text.in_(["Список ДЗ", "📚 Список ДЗ"]))
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
@@ -336,7 +335,6 @@ async def view_homework_cmd(msg: Message):
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
 
-# Отправка одного конкретного задания по кнопке прямо из карточки
 @dp.callback_query(F.data.startswith("send_one:"))
 async def send_one_callback(call: CallbackQuery):
     hw_id = int(call.data.split(":")[1])
@@ -494,6 +492,61 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+# Функция отправки
+async def send_due_homework(force_resend: bool = False) -> int:
+    now_md = datetime.now(TZ)
+    today_str = now_md.strftime("%Y-%m-%d")
+    sent_count = 0
+
+    query = "SELECT id, subject, task_text, photo_id FROM homework WHERE send_date <= ?"
+    if not force_resend:
+        query += " AND is_sent = 0"
+    query += " ORDER BY id DESC"
+
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, (today_str,)) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
+                text = (
+                    f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
+                    f"<b>Предмет:</b> {html.escape(row['subject'])}\n\n"
+                    f"<blockquote>{clean_task}</blockquote>"
+                )
+                try:
+                    if row["photo_id"]:
+                        await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="HTML")
+                    else:
+                        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="HTML")
+
+                    await db.execute("UPDATE homework SET is_sent = 1 WHERE id = ?", (row["id"],))
+                    sent_count += 1
+                except Exception as e:
+                    logging.error(f"Ошибка отправки ДЗ #{row['id']}: {e}")
+
+            await db.commit()
+
+    if sent_count > 0:
+        await sync_backup()
+    return sent_count
+
+# Обработка «Отправить сейчас» (со значком молнии и без)
+@dp.message(F.text.in_(["Отправить сейчас", "⚡️ Отправить сейчас", "⚡ Отправить сейчас"]))
+@dp.message(Command("send"))
+async def manual_send_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_CHAT_ID:
+        return
+    count = await send_due_homework(force_resend=False)
+    if count == 0:
+        count = await send_due_homework(force_resend=True)
+
+    if count == 0:
+        await msg.answer("В базе нет заданий на сегодня или ранее.", reply_markup=MAIN_KEYBOARD)
+    else:
+        await msg.answer(f"Отправлено заданий: {count}", reply_markup=MAIN_KEYBOARD)
+
+# Обработка нового ДЗ
 @dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
     photo_id = None
@@ -562,61 +615,6 @@ async def handle_homework(msg: Message):
         await msg.answer_photo(photo=photo_id, caption=confirm, reply_markup=kb, parse_mode="HTML")
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
-
-async def send_due_homework(force_resend: bool = False) -> int:
-    now_md = datetime.now(TZ)
-    today_str = now_md.strftime("%Y-%m-%d")
-    sent_count = 0
-
-    query = "SELECT id, subject, task_text, photo_id FROM homework WHERE send_date <= ?"
-    if not force_resend:
-        query += " AND is_sent = 0"
-    query += " ORDER BY id DESC"
-
-    async with aiosqlite.connect("school.db") as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(query, (today_str,)) as cursor:
-            rows = await cursor.fetchall()
-            for row in rows:
-                clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
-                text = (
-                    f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
-                    f"<b>Предмет:</b> {html.escape(row['subject'])}\n\n"
-                    f"<blockquote>{clean_task}</blockquote>"
-                )
-                try:
-                    if row["photo_id"]:
-                        await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="HTML")
-                    else:
-                        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="HTML")
-
-                    await db.execute("UPDATE homework SET is_sent = 1 WHERE id = ?", (row["id"],))
-                    sent_count += 1
-                except Exception as e:
-                    logging.error(f"Ошибка отправки ДЗ #{row['id']}: {e}")
-
-            await db.commit()
-
-    if sent_count > 0:
-        await sync_backup()
-    return sent_count
-
-# Кнопка «Отправить сейчас» принудительно отправляет всё актуальное за сегодня
-@dp.message(F.text == "Отправить сейчас")
-@dp.message(Command("send"))
-async def manual_send_cmd(msg: Message):
-    if msg.from_user.id != ADMIN_CHAT_ID:
-        return
-    # Сначала пытаемся отправить неотправленные
-    count = await send_due_homework(force_resend=False)
-    # Если неотправленных не было, отправляем повторно сегодняшние
-    if count == 0:
-        count = await send_due_homework(force_resend=True)
-
-    if count == 0:
-        await msg.answer("В базе нет заданий на сегодня или ранее.", reply_markup=MAIN_KEYBOARD)
-    else:
-        await msg.answer(f"Отправлено заданий: {count}", reply_markup=MAIN_KEYBOARD)
 
 async def main():
     await init_db()
