@@ -6,8 +6,11 @@ import asyncio
 import aiosqlite
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================= КОНФИГУРАЦИЯ =================
@@ -18,7 +21,6 @@ SEND_HOUR = 15
 SEND_MINUTE = 30
 PORT = int(os.environ.get("PORT", 10000))
 
-# ТВОЕ ТОЧНОЕ РАСПИСАНИЕ (8-Б КЛАСС)
 SCHEDULE = {
     0: ["рум. яз.", "англ. яз.", "история", "математика", "физика", "география", "информ."],
     1: ["муз. восп.", "рум. яз.", "история", "болг. яз.", "гв", "рус. яз.", "англ. яз."],
@@ -35,10 +37,14 @@ DAYS_MAP = {
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone="Europe/Chisinau")
 
-# Фоновый сервер для Render
+# Состояния редактирования
+class EditHW(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_subject = State()
+
 async def web_handle(request):
     return web.Response(text="Bot is running!")
 
@@ -50,7 +56,6 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-# --- База данных ---
 async def init_db():
     async with aiosqlite.connect("school.db") as db:
         await db.execute("""
@@ -65,16 +70,14 @@ async def init_db():
         """)
         await db.commit()
 
-# --- Резервная копия в Telegram (чтобы ДЗ не пропадало при перезапуске сервера) ---
 async def sync_backup():
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0") as cursor:
+        async with db.execute("SELECT id, subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0") as cursor:
             rows = await cursor.fetchall()
             data = [dict(row) for row in rows]
 
-    backup_text = f"📦 BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
-    
+    backup_text = f"BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
     try:
         chat = await bot.get_chat(ADMIN_CHAT_ID)
         pinned = chat.pinned_message
@@ -91,26 +94,24 @@ async def restore_from_backup():
         chat = await bot.get_chat(ADMIN_CHAT_ID)
         pinned = chat.pinned_message
         if pinned and "BACKUP_DATA" in (pinned.text or ""):
-            json_str = pinned.text.split("📦 BACKUP_DATA:\n", 1)[1]
+            json_str = pinned.text.split("BACKUP_DATA:\n", 1)[1]
             data = json.loads(json_str)
             async with aiosqlite.connect("school.db") as db:
                 for item in data:
-                    # Проверяем, есть ли уже такая запись
                     async with db.execute(
-                        "SELECT id FROM homework WHERE subject = ? AND send_date = ? AND is_sent = 0",
-                        (item["subject"], item["send_date"])
+                        "SELECT id FROM homework WHERE id = ?",
+                        (item.get("id"),)
                     ) as cursor:
                         if not await cursor.fetchone():
                             await db.execute(
-                                "INSERT INTO homework (subject, task_text, photo_id, send_date) VALUES (?, ?, ?, ?)",
-                                (item["subject"], item["task_text"], item["photo_id"], item["send_date"])
+                                "INSERT INTO homework (id, subject, task_text, photo_id, send_date) VALUES (?, ?, ?, ?, ?)",
+                                (item.get("id"), item["subject"], item["task_text"], item["photo_id"], item["send_date"])
                             )
                 await db.commit()
-            print("Успешно восстановлено ДЗ из резервной копии!")
+            print("База восстановлена из резервной копии.")
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
-# --- Умный поиск предмета ---
 def normalize_subject(name: str) -> str:
     s = name.strip().lower()
     aliases = {
@@ -139,8 +140,6 @@ def normalize_subject(name: str) -> str:
 def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[None, None]:
     norm_subj = normalize_subject(subj_query)
     today = datetime.now().date()
-    
-    # Ищем урок на ближайшие 14 дней (начиная со следующего дня)
     for offset in range(1, 15):
         target_date = today + timedelta(days=offset)
         weekday = target_date.weekday()
@@ -150,20 +149,163 @@ def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[
                 return target_date, real_subj.upper()
     return None, None
 
+def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Удалить", callback_data=f"del_hw:{hw_id}"),
+            InlineKeyboardButton(text="Изменить текст", callback_data=f"edit_text:{hw_id}"),
+            InlineKeyboardButton(text="Изменить предмет", callback_data=f"edit_subj:{hw_id}")
+        ]
+    ])
+
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     await msg.answer(
-        "👋 **Бот 8-Б класса готов!**\n\n"
-        "Расписание уже загружено. Просто отправляй ДЗ на переменках:\n"
-        "• **Фото доски:** прикрепи фото и подпиши `Химия` (или `Химия: упр 2`)\n"
-        "• **Текстом:** `Румынский: выучить слова на стр 15`\n\n"
-        "⏰ Бот сам найдет ближайший день этого урока и пришлет всё ровно в **15:30**."
+        "Бот 8-Б класса готов к работе.\n\n"
+        "Команды:\n"
+        "/dz — список всех сохраненных заданий (можно удалить или изменить)\n"
+        "/расписание — расписание уроков на неделю\n"
+        "/cancel — отмена текущего действия\n\n"
+        "Отправка заданий:\n"
+        "- Фото доски: фото с названием предмета в подписи (например: Химия или Химия: задачи 1 и 2)\n"
+        "- Текстом: Румынский: выучить слова на стр 15"
     )
 
-# --- Прием домашних заданий ---
-@dp.message(F.from_user.id == ADMIN_CHAT_ID)
+@dp.message(Command("cancel"))
+async def cancel_fsm(msg: Message, state: FSMContext):
+    if msg.from_user.id != ADMIN_CHAT_ID:
+        return
+    current_state = await state.get_state()
+    if current_state is None:
+        await msg.answer("Нет активных действий для отмены.")
+        return
+    await state.clear()
+    await msg.answer("Действие отменено.")
+
+# Просмотр расписания уроков на неделю
+@dp.message(Command("расписание"))
+async def view_schedule_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_CHAT_ID:
+        return
+    lines = ["Расписание 8-Б класса:"]
+    for day_idx in range(5):
+        day_name = DAYS_MAP[day_idx].capitalize()
+        lines.append(f"\n{day_name}:")
+        for num, subj in enumerate(SCHEDULE[day_idx], start=1):
+            lines.append(f"  {num}. {subj.capitalize()}")
+    await msg.answer("\n".join(lines))
+
+# Просмотр всех сохраненных заданий
+@dp.message(Command("dz"))
+async def view_homework_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_CHAT_ID:
+        return
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await msg.answer("Активных сохраненных заданий нет.")
+        return
+
+    await msg.answer(f"Всего заданий в очереди: {len(rows)}")
+    for row in rows:
+        text = (
+            f"Задание #{row['id']}\n"
+            f"Предмет: {row['subject']}\n"
+            f"Дата отправки: {row['send_date']} в 15:30\n"
+            f"Содержание:\n{row['task_text']}"
+        )
+        kb = make_hw_kb(row["id"])
+        if row["photo_id"]:
+            await msg.answer_photo(photo=row["photo_id"], caption=text, reply_markup=kb)
+        else:
+            await msg.answer(text=text, reply_markup=kb)
+
+# Удаление задания
+@dp.callback_query(F.data.startswith("del_hw:"))
+async def delete_hw_callback(call: CallbackQuery):
+    hw_id = int(call.data.split(":")[1])
+    async with aiosqlite.connect("school.db") as db:
+        await db.execute("DELETE FROM homework WHERE id = ?", (hw_id,))
+        await db.commit()
+    await sync_backup()
+    await call.answer("Задание удалено.")
+    del_text = f"Задание #{hw_id} удалено."
+    if call.message.photo:
+        await call.message.edit_caption(caption=del_text)
+    else:
+        await call.message.edit_text(text=del_text)
+
+# Изменение текста: запрос нового текста
+@dp.callback_query(F.data.startswith("edit_text:"))
+async def edit_text_start(call: CallbackQuery, state: FSMContext):
+    hw_id = int(call.data.split(":")[1])
+    await state.update_data(hw_id=hw_id)
+    await state.set_state(EditHW.waiting_for_text)
+    await call.answer()
+    await call.message.reply(f"Отправь новый текст задания для #{hw_id}.\nДля отмены напиши /cancel.")
+
+# Изменение текста: сохранение
+@dp.message(EditHW.waiting_for_text, F.from_user.id == ADMIN_CHAT_ID)
+async def edit_text_finish(msg: Message, state: FSMContext):
+    new_text = msg.text or msg.caption or ""
+    if not new_text:
+        await msg.answer("Текст не может быть пустым. Отправь новый текст или напиши /cancel.")
+        return
+    data = await state.get_data()
+    hw_id = data["hw_id"]
+    async with aiosqlite.connect("school.db") as db:
+        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (new_text, hw_id))
+        await db.commit()
+    await sync_backup()
+    await state.clear()
+    await msg.answer(f"Текст задания #{hw_id} успешно обновлен на:\n{new_text}")
+
+# Изменение предмета: запрос названия
+@dp.callback_query(F.data.startswith("edit_subj:"))
+async def edit_subj_start(call: CallbackQuery, state: FSMContext):
+    hw_id = int(call.data.split(":")[1])
+    await state.update_data(hw_id=hw_id)
+    await state.set_state(EditHW.waiting_for_subject)
+    await call.answer()
+    await call.message.reply(f"Отправь новое название предмета для #{hw_id}.\nДля отмены напиши /cancel.")
+
+# Изменение предмета: пересчет даты и сохранение
+@dp.message(EditHW.waiting_for_subject, F.from_user.id == ADMIN_CHAT_ID)
+async def edit_subj_finish(msg: Message, state: FSMContext):
+    new_subj = (msg.text or "").strip()
+    lesson_date, matched_name = find_next_lesson_date(new_subj)
+    if not lesson_date:
+        await msg.answer(f"Предмет «{new_subj}» не найден в расписании. Попробуй еще раз или напиши /cancel.")
+        return
+
+    data = await state.get_data()
+    hw_id = data["hw_id"]
+    send_date_str = lesson_date.strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect("school.db") as db:
+        await db.execute(
+            "UPDATE homework SET subject = ?, send_date = ? WHERE id = ?",
+            (matched_name, send_date_str, hw_id)
+        )
+        await db.commit()
+
+    await sync_backup()
+    await state.clear()
+    weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
+    await msg.answer(
+        f"Предмет для задания #{hw_id} изменен на: {matched_name}\n"
+        f"Новая дата отправки: {weekday_ru}, {lesson_date.strftime('%d.%m')} в 15:30"
+    )
+
+# Прием нового домашнего задания (срабатывает, только если не включен режим редактирования)
+@dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
     photo_id = None
     raw_text = ""
@@ -172,7 +314,7 @@ async def handle_homework(msg: Message):
         photo_id = msg.photo[-1].file_id
         raw_text = (msg.caption or "").strip()
         if not raw_text:
-            await msg.answer("⚠️ Ты отправил фото без названия предмета! Напиши в подписи, например: `Химия`.")
+            await msg.answer("Ошибка: фото отправлено без названия предмета. Напиши предмет в подписи к фото.")
             return
     else:
         raw_text = (msg.text or "").strip()
@@ -185,41 +327,42 @@ async def handle_homework(msg: Message):
 
     lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(f"❌ Не нашел предмет «{subject}» в расписании 8-Б класса. Проверь название!")
+        await msg.answer(f"Предмет «{subject}» не найден в расписании 8-Б класса.")
         return
 
     if photo_id:
-        final_text = f"📸 Задание на фото с доски!\nДополнительно: {task}" if task else "📸 Задание на фото с доски 👆"
+        final_text = f"Задание на фото с доски.\nПримечание: {task}" if task else "Задание на фото с доски."
     else:
-        final_text = f"📝 {task}" if task else "📝 Задание от учителя"
+        final_text = task if task else "Задание от учителя."
 
     send_date_str = lesson_date.strftime("%Y-%m-%d")
 
     async with aiosqlite.connect("school.db") as db:
-        await db.execute("""
+        cursor = await db.execute("""
             INSERT INTO homework (subject, task_text, photo_id, send_date)
             VALUES (?, ?, ?, ?)
         """, (matched_name, final_text, photo_id, send_date_str))
+        hw_id = cursor.lastrowid
         await db.commit()
 
-    # Синхронизируем бэкап
     await sync_backup()
 
     weekday_ru = DAYS_MAP[lesson_date.weekday()].capitalize()
     confirm = (
-        f"✅ **Записано в копилку!**\n\n"
-        f"📚 Предмет: **{matched_name}**\n"
-        f"📅 Ближайший урок: **{weekday_ru}, {lesson_date.strftime('%d.%m')}**\n"
-        f"⏰ Отправка: **в этот же день в 15:30**\n\n"
-        f"{final_text}"
+        f"Задание #{hw_id} сохранено.\n\n"
+        f"Предмет: {matched_name}\n"
+        f"Ближайший урок: {weekday_ru}, {lesson_date.strftime('%d.%m')}\n"
+        f"Отправка: в день урока в 15:30\n\n"
+        f"Запись:\n{final_text}"
     )
 
+    kb = make_hw_kb(hw_id)
     if photo_id:
-        await msg.answer_photo(photo=photo_id, caption=confirm, parse_mode="Markdown")
+        await msg.answer_photo(photo=photo_id, caption=confirm, reply_markup=kb)
     else:
-        await msg.answer(confirm, parse_mode="Markdown")
+        await msg.answer(confirm, reply_markup=kb)
 
-# --- Отправка в 15:30 ---
+# Ежедневная отправка в 15:30
 async def send_daily():
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     async with aiosqlite.connect("school.db") as db:
@@ -231,19 +374,18 @@ async def send_daily():
             rows = await cursor.fetchall()
             for row in rows:
                 text = (
-                    f"🔔 **ДОМАШНЕЕ ЗАДАНИЕ НА СЕГОДНЯ**\n"
-                    f"📖 Предмет: **{row['subject']}**\n\n"
+                    f"ДОМАШНЕЕ ЗАДАНИЕ НА СЕГОДНЯ\n"
+                    f"Предмет: {row['subject']}\n\n"
                     f"{row['task_text']}"
                 )
                 if row["photo_id"]:
-                    await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="Markdown")
+                    await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text)
                 else:
-                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
+                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
 
                 await db.execute("UPDATE homework SET is_sent = 1 WHERE id = ?", (row["id"],))
             await db.commit()
 
-    # Обновляем бэкап после отправки
     await sync_backup()
 
 async def main():
@@ -254,7 +396,7 @@ async def main():
     scheduler.add_job(send_daily, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
     
-    print("Бот 8-Б класса успешно запущен!")
+    print("Бот 8-Б класса запущен.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
