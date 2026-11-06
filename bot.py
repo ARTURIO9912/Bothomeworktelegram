@@ -27,12 +27,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_
 ADMIN_CHAT_ID = 6243658367
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
-# Render автоматически выдает свой HTTPS адрес в переменную RENDER_EXTERNAL_URL
 WEBAPP_URL = os.environ.get("WEBAPP_URL", os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
 
 TZ = ZoneInfo("Europe/Chisinau")
 
-# Время отправки: 15:10
 SEND_HOUR = 15
 SEND_MINUTE = 10
 PORT = int(os.environ.get("PORT", 10000))
@@ -68,83 +66,279 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 media_group_cache = {}
 
-# HTML-код веб-редактора прямо внутри бота
+# ПРОДВИНУТОЕ ВЕБ-ПРИЛОЖЕНИЕ (MINI APP)
 WEBAPP_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Редактор ДЗ</title>
+  <title>Управление ДЗ 8-Б</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root {
-      --bg: var(--tg-theme-bg-color, #18222d);
+      --bg: var(--tg-theme-bg-color, #17212b);
       --card-bg: var(--tg-theme-secondary-bg-color, #232e3c);
       --text: var(--tg-theme-text-color, #ffffff);
-      --hint: var(--tg-theme-hint-color, #7d8b99);
+      --hint: var(--tg-theme-hint-color, #7f91a4);
       --btn: var(--tg-theme-button-color, #2ea6ff);
       --btn-text: var(--tg-theme-button-text-color, #ffffff);
-      --danger: #e53935;
+      --danger: #ef5350;
+      --success: #4caf50;
+      --border: rgba(255, 255, 255, 0.08);
     }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body {
-      margin: 0; padding: 14px;
+      margin: 0; padding: 12px 14px 80px 14px;
       background-color: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    h2 { margin: 4px 0 16px 0; font-size: 18px; font-weight: 600; text-align: center; }
-    .card {
+    /* Навигация вкладками */
+    .nav {
+      display: flex;
       background: var(--card-bg);
       border-radius: 12px;
-      padding: 12px;
+      padding: 4px;
       margin-bottom: 14px;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+      border: 1px solid var(--border);
     }
-    .card-header {
+    .nav-btn {
+      flex: 1;
+      padding: 9px 4px;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+      background: transparent;
+      color: var(--hint);
+      border: none;
+      border-radius: 9px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .nav-btn.active {
+      background: var(--btn);
+      color: var(--btn-text);
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* Карточки заданий */
+    .card {
+      background: var(--card-bg);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 14px;
+      border: 1px solid var(--border);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+    .card-top {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
+      gap: 8px;
     }
-    .subj { font-size: 16px; font-weight: bold; color: var(--btn); }
-    .date { font-size: 12px; color: var(--hint); }
-    textarea {
-      width: 100%;
-      box-sizing: border-box;
+    .subj-select, input, select {
       background: var(--bg);
       color: var(--text);
-      border: 1px solid rgba(255,255,255,0.08);
+      border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 10px;
-      font-size: 14px;
-      line-height: 1.4;
-      resize: vertical;
-      min-height: 80px;
-      font-family: inherit;
-    }
-    .btn-row {
-      display: flex;
-      gap: 10px;
-      margin-top: 10px;
-    }
-    button {
-      flex: 1;
-      padding: 9px;
-      border-radius: 8px;
-      border: none;
+      padding: 8px 10px;
       font-size: 14px;
       font-weight: 600;
+      outline: none;
+    }
+    .date-badge {
+      font-size: 12px;
+      color: var(--hint);
+      text-align: right;
+    }
+    textarea {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.45;
+      resize: vertical;
+      min-height: 85px;
+      outline: none;
+      font-family: inherit;
+    }
+    textarea:focus, input:focus, select:focus {
+      border-color: var(--btn);
+    }
+
+    /* Блок помощи ИИ */
+    .ai-bar {
+      display: flex;
+      gap: 6px;
+      margin: 8px 0 12px 0;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .ai-chip {
+      background: rgba(46, 166, 255, 0.12);
+      color: var(--btn);
+      border: 1px solid rgba(46, 166, 255, 0.25);
+      border-radius: 20px;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
       cursor: pointer;
     }
-    button:active { opacity: 0.7; }
+    .ai-chip:active { opacity: 0.6; }
+
+    /* Кнопки действий */
+    .btn-row {
+      display: flex;
+      gap: 8px;
+    }
+    .btn {
+      flex: 1;
+      padding: 9px;
+      border-radius: 9px;
+      border: none;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 0.15s;
+    }
+    .btn:active { opacity: 0.7; }
     .btn-save { background: var(--btn); color: var(--btn-text); }
-    .btn-del { background: rgba(229, 57, 53, 0.15); color: var(--danger); }
-    .empty { text-align: center; color: var(--hint); margin-top: 40px; font-size: 15px; }
+    .btn-send { background: rgba(76, 175, 80, 0.18); color: var(--success); }
+    .btn-del { background: rgba(239, 83, 80, 0.15); color: var(--danger); flex: 0.6; }
+
+    /* Форма добавления нового задания */
+    .form-group {
+      margin-bottom: 12px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: var(--hint);
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+    .form-group select, .form-group textarea {
+      width: 100%;
+    }
+
+    /* Таблица расписания */
+    .sched-day {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+      border: 1px solid var(--border);
+    }
+    .sched-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--btn);
+      margin-bottom: 6px;
+    }
+    .sched-item {
+      font-size: 13px;
+      padding: 3px 0;
+      color: var(--text);
+    }
+
+    /* Тост-уведомление */
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: #2b394a;
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 25px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+      border: 1px solid var(--border);
+      opacity: 0;
+      transition: all 0.25s ease;
+      z-index: 999;
+      pointer-events: none;
+    }
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+    .loading-spin {
+      text-align: center;
+      color: var(--hint);
+      padding: 30px;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
-  <h2>Редактор заданий 8-Б класса</h2>
-  <div id="list">Загрузка заданий...</div>
+
+  <!-- Навигация вкладками -->
+  <div class="nav">
+    <button class="nav-btn active" onclick="switchTab('tasks')">Задания</button>
+    <button class="nav-btn" onclick="switchTab('add')">+ Добавить ДЗ</button>
+    <button class="nav-btn" onclick="switchTab('schedule')">Расписание</button>
+  </div>
+
+  <!-- ВКЛАДКА 1: Список заданий -->
+  <div id="tab-tasks" class="tab-content active">
+    <div id="tasks-list" class="loading-spin">Загрузка очереди...</div>
+  </div>
+
+  <!-- ВКЛАДКА 2: Создание задания -->
+  <div id="tab-add" class="tab-content">
+    <div class="card">
+      <div class="form-group">
+        <label>ПРЕДМЕТ</label>
+        <select id="new-subj">
+          <option value="Химия">Химия</option>
+          <option value="Рум. яз.">Рум. яз.</option>
+          <option value="Математика">Математика</option>
+          <option value="Литература">Литература</option>
+          <option value="История">История</option>
+          <option value="Физика">Физика</option>
+          <option value="Биология">Биология</option>
+          <option value="Англ. яз.">Англ. яз.</option>
+          <option value="Болг. яз.">Болг. яз.</option>
+          <option value="Рус. яз.">Рус. яз.</option>
+          <option value="Информ.">Информ.</option>
+          <option value="География">География</option>
+          <option value="РЛ">РЛ (Развитие личности)</option>
+          <option value="ГВ">ГВ</option>
+          <option value="Труд">Труд</option>
+          <option value="Физ. восп.">Физ. восп.</option>
+          <option value="Муз. восп.">Муз. восп.</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>ЧТО ЗАДАНО</label>
+        <textarea id="new-text" placeholder="Например: прочитать параграф 4, выполнить номера 12 и 14"></textarea>
+      </div>
+      <div class="ai-bar">
+        <div class="ai-chip" onclick="applyAiToNew('Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
+        <div class="ai-chip" onclick="applyAiToNew('Сделай короче')">✂️ Короче</div>
+        <div class="ai-chip" onclick="applyAiToNew('Разбей на пункты 1, 2, 3')">📋 Списком</div>
+      </div>
+      <button class="btn btn-save" style="width: 100%; padding: 12px; margin-top: 4px;" onclick="addNewTask()">Сохранить в очередь</button>
+    </div>
+  </div>
+
+  <!-- ВКЛАДКА 3: Расписание -->
+  <div id="tab-schedule" class="tab-content">
+    <div id="schedule-box" class="loading-spin">Загрузка расписания...</div>
+  </div>
+
+  <div id="toast" class="toast">Сохранено</div>
 
   <script>
     const tg = window.Telegram?.WebApp;
@@ -153,68 +347,97 @@ WEBAPP_HTML = """<!DOCTYPE html>
       tg.expand();
     }
 
+    function showToast(text) {
+      const t = document.getElementById('toast');
+      t.innerText = text;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2200);
+      if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+    }
+
+    function switchTab(name) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById('tab-' + name).classList.add('active');
+      event.target.classList.add('active');
+      if (name === 'tasks') loadTasks();
+      if (name === 'schedule') loadSchedule();
+    }
+
+    const ALL_SUBJECTS = [
+      "Химия", "Рум. яз.", "Математика", "Литература", "История", "Физика", 
+      "Биология", "Англ. яз.", "Болг. яз.", "Рус. яз.", "Информ.", "География", 
+      "РЛ", "ГВ", "Труд", "Физ. восп.", "Муз. восп."
+    ];
+
     async function loadTasks() {
+      const container = document.getElementById('tasks-list');
       try {
         const res = await fetch('/api/homework');
         const tasks = await res.json();
-        const container = document.getElementById('list');
         if (!tasks || tasks.length === 0) {
-          container.innerHTML = '<div class="empty">Активных заданий нет</div>';
+          container.innerHTML = '<div class="loading-spin">📭 Активных заданий нет.<br>Нажми «+ Добавить ДЗ» чтобы создать!</div>';
           return;
         }
         container.innerHTML = '';
         tasks.forEach(t => {
           const card = document.createElement('div');
           card.className = 'card';
-          card.id = 'task-' + t.id;
-          
+          card.id = 'task-card-' + t.id;
+
           let cleanText = t.task_text.replace(/<[^>]+>/g, '').trim();
 
+          let optionsHtml = '';
+          ALL_SUBJECTS.forEach(s => {
+            const sel = (s.toLowerCase() === t.subject.toLowerCase() || t.subject.toLowerCase().includes(s.toLowerCase())) ? 'selected' : '';
+            optionsHtml += `<option value="${s}" ${sel}>${s}</option>`;
+          });
+
           card.innerHTML = `
-            <div class="card-header">
-              <span class="subj">${t.subject}</span>
-              <span class="date">${t.date_info}</span>
+            <div class="card-top">
+              <select class="subj-select" id="subj-${t.id}">
+                ${optionsHtml}
+              </select>
+              <div class="date-badge">${t.date_info}</div>
             </div>
             <textarea id="text-${t.id}">${cleanText}</textarea>
+            <div class="ai-bar">
+              <div class="ai-chip" onclick="applyAiToTask(${t.id}, 'Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
+              <div class="ai-chip" onclick="applyAiToTask(${t.id}, 'Сделай короче')">✂️ Короче</div>
+              <div class="ai-chip" onclick="applyAiToTask(${t.id}, 'Разбей по пунктам')">📋 Списком</div>
+            </div>
             <div class="btn-row">
-              <button class="btn-del" onclick="deleteTask(${t.id})">Удалить</button>
-              <button class="btn-save" onclick="saveTask(${t.id})">Сохранить</button>
+              <button class="btn btn-del" onclick="deleteTask(${t.id})">Удалить</button>
+              <button class="btn btn-send" onclick="sendNow(${t.id})">В чат</button>
+              <button class="btn btn-save" onclick="saveTask(${t.id})">Сохранить</button>
             </div>
           `;
           container.appendChild(card);
         });
       } catch (e) {
-        document.getElementById('list').innerHTML = '<div class="empty">Ошибка загрузки заданий</div>';
+        container.innerHTML = '<div class="loading-spin">Ошибка загрузки. Проверь соединение.</div>';
       }
     }
 
     async function saveTask(id) {
-      const textarea = document.getElementById('text-' + id);
-      const text = textarea.value.trim();
-      if (!text) {
-        alert('Текст не может быть пустым');
-        return;
-      }
+      const text = document.getElementById('text-' + id).value.trim();
+      const subject = document.getElementById('subj-' + id).value;
+      if (!text) { alert('Текст не может быть пустым'); return; }
+
       try {
         const res = await fetch('/api/save', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ id, text })
+          body: JSON.stringify({ id, text, subject })
         });
         const data = await res.json();
-        if (data.ok) {
-          if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
-          alert('Сохранено!');
-        } else {
-          alert('Ошибка при сохранении');
-        }
-      } catch (e) {
-        alert('Ошибка соединения с сервером');
-      }
+        if (data.ok) showToast('Сохранено!');
+        else alert('Ошибка сохранения');
+      } catch (e) { alert('Ошибка сети'); }
     }
 
     async function deleteTask(id) {
-      if (!confirm('Точно удалить это задание?')) return;
+      if (!confirm('Удалить это задание из очереди?')) return;
       try {
         const res = await fetch('/api/delete', {
           method: 'POST',
@@ -223,14 +446,118 @@ WEBAPP_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.ok) {
-          const el = document.getElementById('task-' + id);
-          if (el) el.remove();
-          if (document.querySelectorAll('.card').length === 0) {
-            document.getElementById('list').innerHTML = '<div class="empty">Активных заданий нет</div>';
-          }
+          document.getElementById('task-card-' + id)?.remove();
+          showToast('Удалено');
+          if (document.querySelectorAll('.card').length === 0) loadTasks();
+        }
+      } catch (e) { alert('Ошибка при удалении'); }
+    }
+
+    async function sendNow(id) {
+      try {
+        const res = await fetch('/api/send_item', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (data.ok) showToast('Отправлено в чат!');
+      } catch (e) { alert('Ошибка отправки'); }
+    }
+
+    async function applyAiToTask(id, instruction) {
+      const textarea = document.getElementById('text-' + id);
+      const subject = document.getElementById('subj-' + id).value;
+      const original = textarea.value.trim();
+      if (!original) return;
+
+      textarea.value = 'ИИ думает...';
+      try {
+        const res = await fetch('/api/ai', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ subject, text: original, instruction })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          textarea.value = data.text;
+          showToast('ИИ переписал текст');
+        } else {
+          textarea.value = original;
+          alert('ИИ временно недоступен');
         }
       } catch (e) {
-        alert('Ошибка при удалении');
+        textarea.value = original;
+      }
+    }
+
+    async function applyAiToNew(instruction) {
+      const textarea = document.getElementById('new-text');
+      const subject = document.getElementById('new-subj').value;
+      const original = textarea.value.trim();
+      if (!original) { alert('Сначала напиши текст задания'); return; }
+
+      textarea.value = 'ИИ думает...';
+      try {
+        const res = await fetch('/api/ai', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ subject, text: original, instruction })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          textarea.value = data.text;
+          showToast('ИИ оформил задание');
+        } else {
+          textarea.value = original;
+        }
+      } catch (e) {
+        textarea.value = original;
+      }
+    }
+
+    async function addNewTask() {
+      const subject = document.getElementById('new-subj').value;
+      const text = document.getElementById('new-text').value.trim();
+      if (!text) { alert('Напиши текст задания'); return; }
+
+      try {
+        const res = await fetch('/api/add', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ subject, text })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          document.getElementById('new-text').value = '';
+          showToast('Задание добавлено в очередь!');
+          setTimeout(() => {
+            document.querySelectorAll('.nav-btn')[0].click();
+          }, 400);
+        } else {
+          alert('Ошибка при добавлении');
+        }
+      } catch (e) { alert('Ошибка сети'); }
+    }
+
+    async function loadSchedule() {
+      const box = document.getElementById('schedule-box');
+      try {
+        const res = await fetch('/api/schedule');
+        const sched = await res.json();
+        const days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница"];
+        let html = '';
+        days.forEach((dayName, idx) => {
+          html += `<div class="sched-day"><div class="sched-title">${dayName}</div>`;
+          const items = sched[idx] || [];
+          items.forEach((item, num) => {
+            html += `<div class="sched-item">${num + 1}. ${item.charAt(0).toUpperCase() + item.slice(1)}</div>`;
+          });
+          html += `</div>`;
+        });
+        box.innerHTML = html;
+      } catch (e) {
+        box.innerHTML = '<div class="loading-spin">Ошибка загрузки расписания</div>';
       }
     }
 
@@ -255,7 +582,7 @@ class EditHW(StatesGroup):
     waiting_for_subject = State()
     waiting_for_ai_prompt = State()
 
-# Веб-сервер и API для Telegram Mini App
+# --- МАРШРУТЫ ДЛЯ WEB APP ---
 async def web_handle(request):
     return web.Response(text=WEBAPP_HTML, content_type="text/html")
 
@@ -283,15 +610,55 @@ async def api_save_homework(request):
         data = await request.json()
         hw_id = int(data.get("id"))
         new_text = str(data.get("text", "")).strip()
+        new_subj = str(data.get("subject", "")).strip()
         if not new_text:
             return web.json_response({"ok": False, "error": "Empty text"})
 
         formatted = format_task_text(new_text, 1)
-        async with aiosqlite.connect("school.db") as db:
-            await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
-            await db.commit()
+
+        lesson_date, matched_name = find_next_lesson_date(new_subj)
+        if lesson_date:
+            rem_d = calculate_reminder_date(lesson_date).strftime("%Y-%m-%d")
+            async with aiosqlite.connect("school.db") as db:
+                await db.execute("UPDATE homework SET task_text = ?, subject = ?, send_date = ? WHERE id = ?", (formatted, matched_name, rem_d, hw_id))
+                await db.commit()
+        else:
+            async with aiosqlite.connect("school.db") as db:
+                await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
+                await db.commit()
+
         await sync_backup()
         return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
+async def api_add_homework(request):
+    try:
+        data = await request.json()
+        subj = str(data.get("subject", "")).strip()
+        text = str(data.get("text", "")).strip()
+        if not subj or not text:
+            return web.json_response({"ok": False, "error": "Empty data"})
+
+        lesson_date, matched_name = find_next_lesson_date(subj)
+        if not lesson_date:
+            matched_name = subj.capitalize()
+            lesson_date = datetime.now(TZ).date() + timedelta(days=1)
+
+        reminder_date = calculate_reminder_date(lesson_date)
+        send_date_str = reminder_date.strftime("%Y-%m-%d")
+        final_text = format_task_text(text, 0)
+
+        async with aiosqlite.connect("school.db") as db:
+            cursor = await db.execute("""
+                INSERT INTO homework (subject, task_text, photo_id, send_date)
+                VALUES (?, ?, ?, ?)
+            """, (matched_name, final_text, None, send_date_str))
+            hw_id = cursor.lastrowid
+            await db.commit()
+
+        await sync_backup()
+        return web.json_response({"ok": True, "id": hw_id})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)})
 
@@ -307,13 +674,48 @@ async def api_delete_homework(request):
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)})
 
+async def api_ai_improve(request):
+    try:
+        data = await request.json()
+        subject = str(data.get("subject", "Предмет"))
+        text = str(data.get("text", ""))
+        instruction = str(data.get("instruction", ""))
+        better = await improve_with_ai(subject, text, instruction)
+        return web.json_response({"ok": True, "text": better})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
+async def api_send_item_now(request):
+    try:
+        data = await request.json()
+        hw_id = int(data.get("id"))
+        async with aiosqlite.connect("school.db") as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT subject, task_text, photo_id FROM homework WHERE id = ?", (hw_id,)) as cursor:
+                row = await cursor.fetchone()
+
+        if row:
+            await send_hw_item(row["subject"], row["task_text"], row["photo_id"])
+            return web.json_response({"ok": True})
+        return web.json_response({"ok": False, "error": "Not found"})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
+async def api_get_schedule(request):
+    return web.json_response(SCHEDULE)
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", web_handle)
     app.router.add_get("/webapp", web_handle)
     app.router.add_get("/api/homework", api_get_homework)
     app.router.add_post("/api/save", api_save_homework)
+    app.router.add_post("/api/add", api_add_homework)
     app.router.add_post("/api/delete", api_delete_homework)
+    app.router.add_post("/api/ai", api_ai_improve)
+    app.router.add_post("/api/send_item", api_send_item_now)
+    app.router.add_get("/api/schedule", api_get_schedule)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -372,12 +774,11 @@ async def restore_from_backup():
                                 (item.get("id"), item["subject"].capitalize(), clean_text, item["photo_id"], item["send_date"])
                             )
                 await db.commit()
-            print("База восстановлена из резервной копии.")
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
 def calculate_reminder_date(lesson_date: datetime.date) -> datetime.date:
-    if lesson_date.weekday() == 0:  # Понедельник -> отправка в пятницу
+    if lesson_date.weekday() == 0:
         return lesson_date - timedelta(days=3)
     return lesson_date - timedelta(days=1)
 
@@ -557,7 +958,7 @@ def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     ]
     if has_web:
         buttons.append([
-            InlineKeyboardButton(text="📱 Изменить в Web", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
+            InlineKeyboardButton(text="📱 Открыть в Web", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
         ])
     buttons.extend([
         [
@@ -579,7 +980,7 @@ async def start_cmd(msg: Message):
         "👋 <b>Бот 8-Б класса готов к работе.</b>\n\n"
         "Кнопки меню закреплены снизу:\n"
         "• <b>📚 Список ДЗ</b> — просмотр заданий\n"
-        "• <b>📱 Веб-редактор</b> — удобное редактирование через окно Web App\n"
+        "• <b>📱 Веб-редактор</b> — удобное добавление и редактирование через Web App\n"
         "• <b>📅 Расписание</b> — уроки на неделю\n"
         "• <b>⚡️ Отправить сейчас</b> — выгрузить задания\n"
         "• <b>❌ Отмена</b> — сбросить действие\n\n"
@@ -624,7 +1025,7 @@ async def view_homework_cmd(msg: Message):
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, subject, task_text, photo_id, send_date FROM homework ORDER BY send_date ASC"
+            "SELECT id, subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC"
         ) as cursor:
             rows = await cursor.fetchall()
 
@@ -671,6 +1072,7 @@ async def view_homework_cmd(msg: Message):
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
 
+# ОФИЦИАЛЬНОЕ СООБЩЕНИЕ ДЛЯ ГРУППЫ: СТРОГО БЕЗ СМАЙЛИКОВ И БЕЗ КАПСА
 async def send_hw_item(subject: str, task_text: str, photo_field: str | None):
     photos = get_photo_list(photo_field)
     
