@@ -14,7 +14,7 @@ from aiogram.types import (
     Message, CallbackQuery, 
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    InputMediaPhoto
+    InputMediaPhoto, WebAppInfo
 )
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -27,10 +27,14 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_
 ADMIN_CHAT_ID = 6243658367
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
+# Render автоматически выдает свой HTTPS адрес в переменную RENDER_EXTERNAL_URL
+WEBAPP_URL = os.environ.get("WEBAPP_URL", os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
+
 TZ = ZoneInfo("Europe/Chisinau")
 
+# Время отправки: 15:10
 SEND_HOUR = 15
-SEND_MINUTE = 0
+SEND_MINUTE = 10
 PORT = int(os.environ.get("PORT", 10000))
 
 SCHEDULE = {
@@ -46,7 +50,6 @@ DAYS_MAP = {
     3: "четверг", 4: "пятница", 5: "суббота", 6: "воскресенье"
 }
 
-# Дни недели в винительном падеже (без капса)
 ACCUSATIVE_DAYS = {
     0: "понедельник",
     1: "вторник",
@@ -65,26 +68,252 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 media_group_cache = {}
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")],
-        [KeyboardButton(text="⚡️ Отправить сейчас"), KeyboardButton(text="❌ Отмена")]
-    ],
-    resize_keyboard=True,
-    is_persistent=True
-)
+# HTML-код веб-редактора прямо внутри бота
+WEBAPP_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Редактор ДЗ</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: var(--tg-theme-bg-color, #18222d);
+      --card-bg: var(--tg-theme-secondary-bg-color, #232e3c);
+      --text: var(--tg-theme-text-color, #ffffff);
+      --hint: var(--tg-theme-hint-color, #7d8b99);
+      --btn: var(--tg-theme-button-color, #2ea6ff);
+      --btn-text: var(--tg-theme-button-text-color, #ffffff);
+      --danger: #e53935;
+    }
+    body {
+      margin: 0; padding: 14px;
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    h2 { margin: 4px 0 16px 0; font-size: 18px; font-weight: 600; text-align: center; }
+    .card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 14px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .subj { font-size: 16px; font-weight: bold; color: var(--btn); }
+    .date { font-size: 12px; color: var(--hint); }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 14px;
+      line-height: 1.4;
+      resize: vertical;
+      min-height: 80px;
+      font-family: inherit;
+    }
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    button {
+      flex: 1;
+      padding: 9px;
+      border-radius: 8px;
+      border: none;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:active { opacity: 0.7; }
+    .btn-save { background: var(--btn); color: var(--btn-text); }
+    .btn-del { background: rgba(229, 57, 53, 0.15); color: var(--danger); }
+    .empty { text-align: center; color: var(--hint); margin-top: 40px; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <h2>Редактор заданий 8-Б класса</h2>
+  <div id="list">Загрузка заданий...</div>
+
+  <script>
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+    }
+
+    async function loadTasks() {
+      try {
+        const res = await fetch('/api/homework');
+        const tasks = await res.json();
+        const container = document.getElementById('list');
+        if (!tasks || tasks.length === 0) {
+          container.innerHTML = '<div class="empty">Активных заданий нет</div>';
+          return;
+        }
+        container.innerHTML = '';
+        tasks.forEach(t => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.id = 'task-' + t.id;
+          
+          let cleanText = t.task_text.replace(/<[^>]+>/g, '').trim();
+
+          card.innerHTML = `
+            <div class="card-header">
+              <span class="subj">${t.subject}</span>
+              <span class="date">${t.date_info}</span>
+            </div>
+            <textarea id="text-${t.id}">${cleanText}</textarea>
+            <div class="btn-row">
+              <button class="btn-del" onclick="deleteTask(${t.id})">Удалить</button>
+              <button class="btn-save" onclick="saveTask(${t.id})">Сохранить</button>
+            </div>
+          `;
+          container.appendChild(card);
+        });
+      } catch (e) {
+        document.getElementById('list').innerHTML = '<div class="empty">Ошибка загрузки заданий</div>';
+      }
+    }
+
+    async function saveTask(id) {
+      const textarea = document.getElementById('text-' + id);
+      const text = textarea.value.trim();
+      if (!text) {
+        alert('Текст не может быть пустым');
+        return;
+      }
+      try {
+        const res = await fetch('/api/save', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id, text })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+          alert('Сохранено!');
+        } else {
+          alert('Ошибка при сохранении');
+        }
+      } catch (e) {
+        alert('Ошибка соединения с сервером');
+      }
+    }
+
+    async function deleteTask(id) {
+      if (!confirm('Точно удалить это задание?')) return;
+      try {
+        const res = await fetch('/api/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          const el = document.getElementById('task-' + id);
+          if (el) el.remove();
+          if (document.querySelectorAll('.card').length === 0) {
+            document.getElementById('list').innerHTML = '<div class="empty">Активных заданий нет</div>';
+          }
+        }
+      } catch (e) {
+        alert('Ошибка при удалении');
+      }
+    }
+
+    loadTasks();
+  </script>
+</body>
+</html>
+"""
+
+def get_main_keyboard():
+    has_web = bool(WEBAPP_URL and WEBAPP_URL.startswith("https://"))
+    buttons = [
+        [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")]
+    ]
+    if has_web:
+        buttons.append([KeyboardButton(text="📱 Веб-редактор", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
+    buttons.append([KeyboardButton(text="⚡️ Отправить сейчас"), KeyboardButton(text="❌ Отмена")])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
 class EditHW(StatesGroup):
     waiting_for_text = State()
     waiting_for_subject = State()
     waiting_for_ai_prompt = State()
 
+# Веб-сервер и API для Telegram Mini App
 async def web_handle(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text=WEBAPP_HTML, content_type="text/html")
+
+async def api_get_homework(request):
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, subject, task_text, photo_id, send_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC") as cursor:
+            rows = await cursor.fetchall()
+            result = []
+            for r in rows:
+                send_d = datetime.strptime(r["send_date"], "%Y-%m-%d").date()
+                lesson_d, _ = find_next_lesson_date(r["subject"])
+                l_date = lesson_d if lesson_d else (send_d + timedelta(days=1))
+                result.append({
+                    "id": r["id"],
+                    "subject": r["subject"],
+                    "task_text": r["task_text"],
+                    "send_date": r["send_date"],
+                    "date_info": f"Урок: {DAYS_MAP[l_date.weekday()].capitalize()} ({l_date.strftime('%d.%m')})"
+                })
+            return web.json_response(result)
+
+async def api_save_homework(request):
+    try:
+        data = await request.json()
+        hw_id = int(data.get("id"))
+        new_text = str(data.get("text", "")).strip()
+        if not new_text:
+            return web.json_response({"ok": False, "error": "Empty text"})
+
+        formatted = format_task_text(new_text, 1)
+        async with aiosqlite.connect("school.db") as db:
+            await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
+            await db.commit()
+        await sync_backup()
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
+async def api_delete_homework(request):
+    try:
+        data = await request.json()
+        hw_id = int(data.get("id"))
+        async with aiosqlite.connect("school.db") as db:
+            await db.execute("DELETE FROM homework WHERE id = ?", (hw_id,))
+            await db.commit()
+        await sync_backup()
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", web_handle)
+    app.router.add_get("/webapp", web_handle)
+    app.router.add_get("/api/homework", api_get_homework)
+    app.router.add_post("/api/save", api_save_homework)
+    app.router.add_post("/api/delete", api_delete_homework)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -316,15 +545,21 @@ def find_next_lesson_date(subj_query: str) -> tuple[datetime.date, str] | tuple[
         day_subjects = SCHEDULE.get(weekday, [])
         for real_subj in day_subjects:
             if norm_subj in real_subj or real_subj in norm_subj:
-                # Название с заглавной буквы, без капса
                 return target_date, real_subj.capitalize()
     return None, None
 
 def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    has_web = bool(WEBAPP_URL and WEBAPP_URL.startswith("https://"))
+    buttons = [
         [
             InlineKeyboardButton(text="📤 Отправить в чат сейчас", callback_data=f"send_one:{hw_id}")
-        ],
+        ]
+    ]
+    if has_web:
+        buttons.append([
+            InlineKeyboardButton(text="📱 Изменить в Web", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
+        ])
+    buttons.extend([
         [
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_hw:{hw_id}"),
             InlineKeyboardButton(text="✏️ Свой текст", callback_data=f"edit_text:{hw_id}")
@@ -334,6 +569,7 @@ def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔄 Сменить предмет", callback_data=f"edit_subj:{hw_id}")
         ]
     ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
@@ -342,14 +578,15 @@ async def start_cmd(msg: Message):
     await msg.answer(
         "👋 <b>Бот 8-Б класса готов к работе.</b>\n\n"
         "Кнопки меню закреплены снизу:\n"
-        "• <b>📚 Список ДЗ</b> — просмотр очереди заданий\n"
+        "• <b>📚 Список ДЗ</b> — просмотр заданий\n"
+        "• <b>📱 Веб-редактор</b> — удобное редактирование через окно Web App\n"
         "• <b>📅 Расписание</b> — уроки на неделю\n"
-        "• <b>⚡️ Отправить сейчас</b> — выгрузить задания прямо сейчас\n"
-        "• <b>❌ Отмена</b> — сбросить редактирование\n\n"
+        "• <b>⚡️ Отправить сейчас</b> — выгрузить задания\n"
+        "• <b>❌ Отмена</b> — сбросить действие\n\n"
         "Отправка заданий на перемене:\n"
         "• Текстом: <code>Румынский: выучить слова на стр 15</code>\n"
         "• Фото (1 или альбом): фото с названием предмета (например, <code>Химия</code>)",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_main_keyboard(),
         parse_mode="HTML"
     )
 
@@ -360,10 +597,10 @@ async def cancel_fsm(msg: Message, state: FSMContext):
         return
     current_state = await state.get_state()
     if current_state is None:
-        await msg.answer("👌 Нет активных действий для отмены.", reply_markup=MAIN_KEYBOARD)
+        await msg.answer("👌 Нет активных действий для отмены.", reply_markup=get_main_keyboard())
         return
     await state.clear()
-    await msg.answer("❌ Действие отменено.", reply_markup=MAIN_KEYBOARD)
+    await msg.answer("❌ Действие отменено.", reply_markup=get_main_keyboard())
 
 @dp.message(F.text.in_(["Расписание", "📅 Расписание"]))
 @dp.message(Command("расписание"))
@@ -377,7 +614,7 @@ async def view_schedule_cmd(msg: Message):
         for num, subj in enumerate(SCHEDULE[day_idx], start=1):
             lines.append(f"  {num}. {html.escape(subj.capitalize())}")
         lines.append("")
-    await msg.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+    await msg.answer("\n".join(lines), reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text.in_(["Список ДЗ", "📚 Список ДЗ"]))
 @dp.message(Command("dz"))
@@ -392,11 +629,11 @@ async def view_homework_cmd(msg: Message):
             rows = await cursor.fetchall()
 
     if not rows:
-        await msg.answer("📭 Активных заданий нет. В очереди пусто.", reply_markup=MAIN_KEYBOARD)
+        await msg.answer("📭 Активных заданий нет. В очереди пусто.", reply_markup=get_main_keyboard())
         return
 
     total = len(rows)
-    await msg.answer(f"📋 <b>В очереди заданий: {total}</b>", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+    await msg.answer(f"📋 <b>В очереди заданий: {total}</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
     for idx, row in enumerate(rows, start=1):
         send_date_obj = datetime.strptime(row["send_date"], "%Y-%m-%d").date()
@@ -420,7 +657,7 @@ async def view_homework_cmd(msg: Message):
             f"📌 <b>Задание {idx} из {total}</b>\n"
             f"📚 <b>Предмет:</b> {html.escape(row['subject'].capitalize())}\n"
             f"📅 <b>Урок:</b> {lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}\n"
-            f"⏰ <b>Отправка:</b> {send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:00\n\n"
+            f"⏰ <b>Отправка:</b> {send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:10\n\n"
             f"📝 <b>Задание:</b>\n"
             f"{task_display}"
         )
@@ -434,7 +671,6 @@ async def view_homework_cmd(msg: Message):
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
 
-# ОФИЦИАЛЬНОЕ СООБЩЕНИЕ ДЛЯ ГРУППЫ: СТРОГО БЕЗ СМАЙЛИКОВ И БЕЗ КАПСА
 async def send_hw_item(subject: str, task_text: str, photo_field: str | None):
     photos = get_photo_list(photo_field)
     
@@ -448,7 +684,6 @@ async def send_hw_item(subject: str, task_text: str, photo_field: str | None):
     else:
         target_day_name = "следующий урок"
 
-    # Строго без капса и без смайликов
     header = (
         f"<b>Домашнее задание на {target_day_name}:</b>\n"
         f"<b>Предмет:</b> {html.escape(subject.capitalize())}\n\n"
@@ -521,7 +756,7 @@ async def edit_text_finish(msg: Message, state: FSMContext):
     
     await msg.answer(
         f"✅ <b>Текст задания обновлен:</b>\n\n{formatted}",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_main_keyboard(),
         parse_mode="HTML"
     )
 
@@ -567,7 +802,7 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
 
     await msg.answer(
         f"✅ <b>Результат от ИИ:</b>\n\n{formatted}",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_main_keyboard(),
         parse_mode="HTML"
     )
 
@@ -609,8 +844,8 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
     await msg.answer(
         f"✅ <b>Предмет изменен на:</b> {html.escape(matched_name)}\n"
         f"📅 <b>Урок будет:</b> {lesson_weekday}, {lesson_date.strftime('%d.%m')}\n"
-        f"⏰ <b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:00",
-        reply_markup=MAIN_KEYBOARD,
+        f"⏰ <b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:10",
+        reply_markup=get_main_keyboard(),
         parse_mode="HTML"
     )
 
@@ -644,7 +879,7 @@ async def handle_homework(msg: Message):
         raw_text = (msg.caption if msg.photo else (msg.text or "")).strip()
 
     if photos and not raw_text:
-        await msg.answer("⚠️ Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: <code>Химия</code>).", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+        await msg.answer("⚠️ Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: <code>Химия</code>).", reply_markup=get_main_keyboard(), parse_mode="HTML")
         return
 
     if ":" in raw_text:
@@ -655,7 +890,7 @@ async def handle_homework(msg: Message):
 
     lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(f"❌ Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+        await msg.answer(f"❌ Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", reply_markup=get_main_keyboard(), parse_mode="HTML")
         return
 
     final_text = format_task_text(task, len(photos))
@@ -681,7 +916,7 @@ async def handle_homework(msg: Message):
         f"✅ <b>Задание сохранено.</b>\n\n"
         f"📚 <b>Предмет:</b> {html.escape(matched_name)}\n"
         f"📅 <b>Урок:</b> {lesson_weekday}, {lesson_date.strftime('%d.%m')}\n"
-        f"⏰ <b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:00\n\n"
+        f"⏰ <b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:10\n\n"
         f"📝 <b>Задание:</b>\n"
         f"{final_text}"
     )
@@ -734,9 +969,9 @@ async def manual_send_cmd(msg: Message):
         count = await send_due_homework(force_resend=True)
 
     if count == 0:
-        await msg.answer("📭 В базе нет заданий на сегодня или ранее.", reply_markup=MAIN_KEYBOARD)
+        await msg.answer("📭 В базе нет заданий на сегодня или ранее.", reply_markup=get_main_keyboard())
     else:
-        await msg.answer(f"✅ Отправлено заданий: {count}", reply_markup=MAIN_KEYBOARD)
+        await msg.answer(f"✅ Отправлено заданий: {count}", reply_markup=get_main_keyboard())
 
 async def main():
     await init_db()
