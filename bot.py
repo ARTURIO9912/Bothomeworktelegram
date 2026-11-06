@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import html
 import logging
@@ -12,7 +13,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, 
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton,
+    InputMediaPhoto
 )
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -21,9 +23,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9004754440:AAHh3KbECKapVbbSJPyAq5WSGX3_-S4r0Ws").strip()
 ADMIN_CHAT_ID = 6243658367
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
 TZ = ZoneInfo("Europe/Chisinau")
 
@@ -49,6 +51,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone=TZ)
+
+# Буфер для сборки альбомов (2 и более фото)
+media_group_cache = {}
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -86,8 +91,6 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
-        await db.execute("UPDATE homework SET task_text = REPLACE(task_text, '📸 ', '')")
-        await db.execute("UPDATE homework SET task_text = REPLACE(task_text, ' 👆', '')")
         await db.commit()
 
 async def sync_backup():
@@ -118,7 +121,6 @@ async def restore_from_backup():
             data = json.loads(json_str)
             async with aiosqlite.connect("school.db") as db:
                 for item in data:
-                    clean_text = item["task_text"].replace("📸 ", "").replace(" 👆", "")
                     async with db.execute(
                         "SELECT id FROM homework WHERE id = ?",
                         (item.get("id"),)
@@ -126,7 +128,7 @@ async def restore_from_backup():
                         if not await cursor.fetchone():
                             await db.execute(
                                 "INSERT INTO homework (id, subject, task_text, photo_id, send_date) VALUES (?, ?, ?, ?, ?)",
-                                (item.get("id"), item["subject"], clean_text, item["photo_id"], item["send_date"])
+                                (item.get("id"), item["subject"], item["task_text"], item["photo_id"], item["send_date"])
                             )
                 await db.commit()
     except Exception as e:
@@ -148,6 +150,70 @@ async def fix_all_dates():
         await db.commit()
     await sync_backup()
 
+# Красивое разбиение подписей к фото на цитаты (Первое фото, Второе фото)
+def format_task_text(task_raw: str, num_photos: int) -> str:
+    if not task_raw:
+        return "<blockquote>Задание на фото с доски.</blockquote>" if num_photos > 0 else ""
+
+    lines = [line.strip() for line in task_raw.strip().split("\n") if line.strip()]
+    
+    # Паттерн для поиска "#1 фото", "1 фото", "фото 1"
+    pattern = re.compile(
+        r'^(?:#?\s*(\d+)\s*(?:фото|photo)|(?:фото|photo)\s*#?\s*(\d+))\s*[:,\-]?\s*(.*)$',
+        re.IGNORECASE
+    )
+    
+    photo_blocks = {}
+    general_lines = []
+    current_idx = None
+    
+    for line in lines:
+        m = pattern.match(line)
+        if m:
+            idx = int(m.group(1) or m.group(2))
+            current_idx = idx
+            remainder = m.group(3).strip()
+            photo_blocks[current_idx] = [remainder] if remainder else []
+        elif current_idx is not None:
+            photo_blocks[current_idx].append(line)
+        else:
+            general_lines.append(line)
+    
+    if photo_blocks:
+        num_words = {
+            1: "Первое фото",
+            2: "Второе фото",
+            3: "Третье фото",
+            4: "Четвертое фото",
+            5: "Пятое фото"
+        }
+        output_parts = []
+        if general_lines:
+            gen = html.escape("\n".join(general_lines))
+            output_parts.append(f"<blockquote>{gen}</blockquote>")
+        
+        for idx in sorted(photo_blocks.keys()):
+            label = num_words.get(idx, f"Фото {idx}")
+            text_content = "\n".join(photo_blocks[idx]).strip()
+            if not text_content:
+                text_content = "Задание на фото"
+            output_parts.append(f"<b>{label}:</b>\n<blockquote>{html.escape(text_content)}</blockquote>")
+        
+        return "\n\n".join(output_parts)
+    else:
+        return f"<blockquote>{html.escape(task_raw)}</blockquote>"
+
+def get_photo_list(photo_field: str | None) -> list[str]:
+    if not photo_field:
+        return []
+    try:
+        data = json.loads(photo_field)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return [photo_field]
+
 async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "") -> str:
     key = os.environ.get("GROQ_API_KEY", "").strip() or GROQ_API_KEY
     if not key:
@@ -155,7 +221,7 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
 
     user_note = f"\nПожелание: {user_instruction}" if user_instruction else ""
 
-    prompt = f"""Ты школьный помощник. Перепиши черновик домашнего задания так, чтобы оно было аккуратным, понятным и готовым для отправки в беседу класса.
+    prompt = f"""Ты школьный помощник. Перепиши текст домашнего задания так, чтобы оно было аккуратным, понятным и готовым для отправки в беседу класса.
 
 Предмет: {subject}
 Черновик: {raw_task}{user_note}
@@ -255,15 +321,14 @@ async def start_cmd(msg: Message):
         "Кнопки меню:\n"
         "• Список ДЗ — просмотр очереди заданий\n"
         "• Расписание — уроки на неделю\n"
-        "• Отправить сейчас — принудительно выгрузить ДЗ прямо сейчас\n"
+        "• Отправить сейчас — выгрузить задания прямо сейчас\n"
         "• Отмена — сбросить редактирование\n\n"
         "Отправка заданий:\n"
         "• Текстом: Румынский: выучить слова на стр 15\n"
-        "• Фото с доски: фото с названием предмета (например, Химия)",
+        "• Фото (можно сразу 1 или 2 фото): прикрепи фото с названием предмета (например, Химия)",
         reply_markup=MAIN_KEYBOARD
     )
 
-# Обработка отмены (со смайликом и без)
 @dp.message(F.text.in_(["Отмена", "❌ Отмена"]))
 @dp.message(Command("cancel"))
 async def cancel_fsm(msg: Message, state: FSMContext):
@@ -276,7 +341,6 @@ async def cancel_fsm(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Действие отменено.", reply_markup=MAIN_KEYBOARD)
 
-# Обработка расписания (со смайликом и без)
 @dp.message(F.text.in_(["Расписание", "📅 Расписание"]))
 @dp.message(Command("расписание"))
 async def view_schedule_cmd(msg: Message):
@@ -291,7 +355,6 @@ async def view_schedule_cmd(msg: Message):
         lines.append("")
     await msg.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
 
-# Обработка Списка ДЗ (со смайликом и без)
 @dp.message(F.text.in_(["Список ДЗ", "📚 Список ДЗ"]))
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
@@ -318,22 +381,43 @@ async def view_homework_cmd(msg: Message):
         send_weekday = DAYS_MAP[send_date_obj.weekday()].capitalize()
         lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
-        clean_text = row['task_text'].replace("📸 ", "").replace(" 👆", "")
-
+        photos = get_photo_list(row["photo_id"])
         card_text = (
             f"Задание {idx} из {total}\n"
             f"Предмет: <b>{html.escape(row['subject'])}</b>\n"
             f"Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
             f"Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
             f"Текст:\n"
-            f"<blockquote>{clean_text}</blockquote>"
+            f"{row['task_text']}"
         )
 
         kb = make_hw_kb(row["id"])
-        if row["photo_id"]:
-            await msg.answer_photo(photo=row["photo_id"], caption=card_text, reply_markup=kb, parse_mode="HTML")
+        if len(photos) > 1:
+            note = f"\n\n<i>(Прикреплено фото: {len(photos)} шт.)</i>"
+            await msg.answer_photo(photo=photos[0], caption=card_text + note, reply_markup=kb, parse_mode="HTML")
+        elif len(photos) == 1:
+            await msg.answer_photo(photo=photos[0], caption=card_text, reply_markup=kb, parse_mode="HTML")
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
+
+# Отправка задания (одиночного или с пачкой фото)
+async def send_hw_item(subject: str, task_text: str, photo_field: str | None):
+    photos = get_photo_list(photo_field)
+    header = (
+        f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
+        f"<b>Предмет:</b> {html.escape(subject)}\n\n"
+        f"{task_text}"
+    )
+
+    if not photos:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=header, parse_mode="HTML")
+    elif len(photos) == 1:
+        await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=photos[0], caption=header, parse_mode="HTML")
+    else:
+        media = [InputMediaPhoto(media=photos[0], caption=header, parse_mode="HTML")]
+        for p in photos[1:]:
+            media.append(InputMediaPhoto(media=p))
+        await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media)
 
 @dp.callback_query(F.data.startswith("send_one:"))
 async def send_one_callback(call: CallbackQuery):
@@ -347,18 +431,7 @@ async def send_one_callback(call: CallbackQuery):
         await call.answer("Задание не найдено.")
         return
 
-    clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
-    text = (
-        f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
-        f"<b>Предмет:</b> {html.escape(row['subject'])}\n\n"
-        f"<blockquote>{clean_task}</blockquote>"
-    )
-
-    if row["photo_id"]:
-        await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="HTML")
-    else:
-        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="HTML")
-
+    await send_hw_item(row["subject"], row["task_text"], row["photo_id"])
     await call.answer("Отправлено в чат!")
 
 @dp.callback_query(F.data.startswith("del_hw:"))
@@ -392,15 +465,17 @@ async def edit_text_finish(msg: Message, state: FSMContext):
     data = await state.get_data()
     hw_id = data["hw_id"]
 
+    # Форматируем новый текст в цитаты
+    formatted = format_task_text(new_text, 1)
+
     async with aiosqlite.connect("school.db") as db:
-        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (new_text, hw_id))
+        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
         await db.commit()
     await sync_backup()
     await state.clear()
     
-    escaped_new = html.escape(new_text)
     await msg.answer(
-        f"Текст задания обновлен:\n<blockquote>{escaped_new}</blockquote>",
+        f"Текст задания обновлен:\n\n{formatted}",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -435,16 +510,17 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
             subj, old_text = row if row else ("Предмет", "")
 
     better_text = await improve_with_ai(subj, old_text, user_instruction)
+    formatted = f"<blockquote>{html.escape(better_text)}</blockquote>"
     await wait_msg.delete()
 
     async with aiosqlite.connect("school.db") as db:
-        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (better_text, hw_id))
+        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
         await db.commit()
     await sync_backup()
     await state.clear()
 
     await msg.answer(
-        f"Результат:\n<blockquote>{better_text}</blockquote>",
+        f"Результат от ИИ:\n\n{formatted}",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -492,7 +568,95 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# Функция отправки
+# Прием домашних заданий (сборка альбомов из 2 фото, без авто-ИИ)
+@dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
+async def handle_homework(msg: Message):
+    # Если пришел альбом из нескольких фото
+    if msg.media_group_id:
+        mg_id = msg.media_group_id
+        if mg_id not in media_group_cache:
+            media_group_cache[mg_id] = {
+                "photos": [msg.photo[-1].file_id] if msg.photo else [],
+                "caption": msg.caption or "",
+                "msg": msg
+            }
+        else:
+            if msg.photo:
+                media_group_cache[mg_id]["photos"].append(msg.photo[-1].file_id)
+            if msg.caption:
+                media_group_cache[mg_id]["caption"] = msg.caption
+
+        # Ждем 1 секунду, чтобы все части альбома дошли
+        await asyncio.sleep(1.0)
+
+        if mg_id in media_group_cache:
+            data = media_group_cache.pop(mg_id)
+            photos = data["photos"]
+            raw_text = (data["caption"] or "").strip()
+            msg = data["msg"]
+        else:
+            # Уже обработано соседней задачей альбома
+            return
+    else:
+        photos = [msg.photo[-1].file_id] if msg.photo else []
+        raw_text = (msg.caption if msg.photo else (msg.text or "")).strip()
+
+    if photos and not raw_text:
+        await msg.answer("Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: Химия).")
+        return
+
+    # Разбираем предмет и подпись
+    if ":" in raw_text:
+        subject, task = raw_text.split(":", 1)
+        subject, task = subject.strip(), task.strip()
+    else:
+        subject, task = raw_text.strip(), ""
+
+    lesson_date, matched_name = find_next_lesson_date(subject)
+    if not lesson_date:
+        await msg.answer(f"Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", parse_mode="HTML")
+        return
+
+    # Форматируем подпись красиво по цитатам БЕЗ автоматического вмешательства ИИ
+    final_text = format_task_text(task, len(photos))
+
+    reminder_date = lesson_date - timedelta(days=1)
+    send_date_str = reminder_date.strftime("%Y-%m-%d")
+    photo_db_val = json.dumps(photos) if photos else None
+
+    async with aiosqlite.connect("school.db") as db:
+        cursor = await db.execute("""
+            INSERT INTO homework (subject, task_text, photo_id, send_date)
+            VALUES (?, ?, ?, ?)
+        """, (matched_name, final_text, photo_db_val, send_date_str))
+        hw_id = cursor.lastrowid
+        await db.commit()
+
+    await sync_backup()
+
+    send_weekday = DAYS_MAP[reminder_date.weekday()].capitalize()
+    lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
+    
+    confirm = (
+        f"Задание сохранено.\n\n"
+        f"Предмет: <b>{html.escape(matched_name)}</b>\n"
+        f"Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
+        f"Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
+        f"Текст для отправки:\n"
+        f"{final_text}"
+    )
+
+    kb = make_hw_kb(hw_id)
+    if len(photos) > 1:
+        media = [InputMediaPhoto(media=p) for p in photos]
+        await msg.answer_media_group(media=media)
+        await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
+    elif len(photos) == 1:
+        await msg.answer_photo(photo=photos[0], caption=confirm, reply_markup=kb, parse_mode="HTML")
+    else:
+        await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
+
+# Функция отправки по расписанию или кнопке
 async def send_due_homework(force_resend: bool = False) -> int:
     now_md = datetime.now(TZ)
     today_str = now_md.strftime("%Y-%m-%d")
@@ -508,18 +672,8 @@ async def send_due_homework(force_resend: bool = False) -> int:
         async with db.execute(query, (today_str,)) as cursor:
             rows = await cursor.fetchall()
             for row in rows:
-                clean_task = row['task_text'].replace("📸 ", "").replace(" 👆", "")
-                text = (
-                    f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
-                    f"<b>Предмет:</b> {html.escape(row['subject'])}\n\n"
-                    f"<blockquote>{clean_task}</blockquote>"
-                )
                 try:
-                    if row["photo_id"]:
-                        await bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=row["photo_id"], caption=text, parse_mode="HTML")
-                    else:
-                        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="HTML")
-
+                    await send_hw_item(row["subject"], row["task_text"], row["photo_id"])
                     await db.execute("UPDATE homework SET is_sent = 1 WHERE id = ?", (row["id"],))
                     sent_count += 1
                 except Exception as e:
@@ -531,7 +685,6 @@ async def send_due_homework(force_resend: bool = False) -> int:
         await sync_backup()
     return sent_count
 
-# Обработка «Отправить сейчас» (со значком молнии и без)
 @dp.message(F.text.in_(["Отправить сейчас", "⚡️ Отправить сейчас", "⚡ Отправить сейчас"]))
 @dp.message(Command("send"))
 async def manual_send_cmd(msg: Message):
@@ -545,76 +698,6 @@ async def manual_send_cmd(msg: Message):
         await msg.answer("В базе нет заданий на сегодня или ранее.", reply_markup=MAIN_KEYBOARD)
     else:
         await msg.answer(f"Отправлено заданий: {count}", reply_markup=MAIN_KEYBOARD)
-
-# Обработка нового ДЗ
-@dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
-async def handle_homework(msg: Message):
-    photo_id = None
-    raw_text = ""
-
-    if msg.photo:
-        photo_id = msg.photo[-1].file_id
-        raw_text = (msg.caption or "").strip()
-        if not raw_text:
-            await msg.answer("Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: Химия).")
-            return
-    else:
-        raw_text = (msg.text or "").strip()
-
-    if ":" in raw_text:
-        subject, task = raw_text.split(":", 1)
-        subject, task = subject.strip(), task.strip()
-    else:
-        subject, task = raw_text.strip(), ""
-
-    lesson_date, matched_name = find_next_lesson_date(subject)
-    if not lesson_date:
-        await msg.answer(f"Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", parse_mode="HTML")
-        return
-
-    if photo_id:
-        if task:
-            wait_msg = await msg.answer("ИИ форматирует подпись к фото...")
-            refined_task = await improve_with_ai(matched_name, task)
-            await wait_msg.delete()
-            final_text = f"Задание на фото с доски.\nПримечание: {refined_task}"
-        else:
-            final_text = "Задание на фото с доски."
-    else:
-        wait_msg = await msg.answer("ИИ форматирует текст...")
-        final_text = await improve_with_ai(matched_name, task if task else "Смотри задание от учителя")
-        await wait_msg.delete()
-
-    reminder_date = lesson_date - timedelta(days=1)
-    send_date_str = reminder_date.strftime("%Y-%m-%d")
-
-    async with aiosqlite.connect("school.db") as db:
-        cursor = await db.execute("""
-            INSERT INTO homework (subject, task_text, photo_id, send_date)
-            VALUES (?, ?, ?, ?)
-        """, (matched_name, final_text, photo_id, send_date_str))
-        hw_id = cursor.lastrowid
-        await db.commit()
-
-    await sync_backup()
-
-    send_weekday = DAYS_MAP[reminder_date.weekday()].capitalize()
-    lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
-    
-    confirm = (
-        f"Задание сохранено.\n\n"
-        f"Предмет: <b>{html.escape(matched_name)}</b>\n"
-        f"Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
-        f"Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
-        f"Текст для отправки:\n"
-        f"<blockquote>{final_text}</blockquote>"
-    )
-
-    kb = make_hw_kb(hw_id)
-    if photo_id:
-        await msg.answer_photo(photo=photo_id, caption=confirm, reply_markup=kb, parse_mode="HTML")
-    else:
-        await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
 async def main():
     await init_db()
