@@ -66,292 +66,332 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 media_group_cache = {}
 
-# ПРОДВИНУТОЕ ВЕБ-ПРИЛОЖЕНИЕ (MINI APP)
+# КРАСИВЫЙ СОВРЕМЕННЫЙ WEB APP ИНТЕРФЕЙС
 WEBAPP_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Управление ДЗ 8-Б</title>
+  <title>ДЗ 8-Б Класс</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root {
-      --bg: var(--tg-theme-bg-color, #17212b);
-      --card-bg: var(--tg-theme-secondary-bg-color, #232e3c);
-      --text: var(--tg-theme-text-color, #ffffff);
-      --hint: var(--tg-theme-hint-color, #7f91a4);
-      --btn: var(--tg-theme-button-color, #2ea6ff);
-      --btn-text: var(--tg-theme-button-text-color, #ffffff);
-      --danger: #ef5350;
-      --success: #4caf50;
+      --bg: #0f141c;
+      --card-bg: #18222e;
+      --card-hover: #1f2c3a;
+      --input-bg: #121922;
+      --text: #ffffff;
+      --hint: #8292a1;
+      --accent: #2ea6ff;
+      --accent-glow: rgba(46, 166, 255, 0.25);
+      --danger: #ff5252;
+      --success: #00e676;
       --border: rgba(255, 255, 255, 0.08);
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; font-family: var(--font); }
     body {
-      margin: 0; padding: 12px 14px 80px 14px;
+      margin: 0; padding: 12px 14px 90px 14px;
       background-color: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    /* Навигация вкладками */
+    /* Навигация */
     .nav {
       display: flex;
-      background: var(--card-bg);
-      border-radius: 12px;
+      background: rgba(24, 34, 46, 0.85);
+      backdrop-filter: blur(10px);
+      border-radius: 14px;
       padding: 4px;
-      margin-bottom: 14px;
+      margin-bottom: 16px;
       border: 1px solid var(--border);
     }
     .nav-btn {
       flex: 1;
-      padding: 9px 4px;
+      padding: 10px 4px;
       font-size: 13px;
-      font-weight: 600;
+      font-weight: 700;
       text-align: center;
       background: transparent;
       color: var(--hint);
       border: none;
-      border-radius: 9px;
+      border-radius: 10px;
       cursor: pointer;
-      transition: all 0.2s;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
     }
     .nav-btn.active {
-      background: var(--btn);
-      color: var(--btn-text);
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 3px 12px var(--accent-glow);
     }
-    .tab-content { display: none; }
+    .tab-content { display: none; animation: fadeIn 0.25s ease; }
     .tab-content.active { display: block; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* Карточки заданий */
+    /* Карточки */
     .card {
       background: var(--card-bg);
-      border-radius: 14px;
-      padding: 14px;
-      margin-bottom: 14px;
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 16px;
       border: 1px solid var(--border);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
     }
-    .card-top {
+    .card-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 10px;
-      gap: 8px;
+      margin-bottom: 12px;
+      gap: 10px;
     }
-    .subj-select, input, select {
-      background: var(--bg);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 8px 10px;
+    /* Кастомная кнопка выбора предмета */
+    .subj-pill {
+      background: rgba(46, 166, 255, 0.12);
+      color: var(--accent);
+      border: 1px solid rgba(46, 166, 255, 0.3);
+      padding: 7px 12px;
+      border-radius: 10px;
       font-size: 14px;
-      font-weight: 600;
-      outline: none;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      transition: all 0.15s;
     }
-    .date-badge {
+    .subj-pill:active { transform: scale(0.96); background: rgba(46, 166, 255, 0.2); }
+    .subj-pill .arrow { font-size: 10px; opacity: 0.7; }
+    .date-info {
       font-size: 12px;
+      font-weight: 500;
       color: var(--hint);
       text-align: right;
     }
     textarea {
       width: 100%;
-      background: var(--bg);
+      background: var(--input-bg);
       color: var(--text);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 10px 12px;
+      border-radius: 12px;
+      padding: 12px;
       font-size: 14px;
       line-height: 1.45;
       resize: vertical;
-      min-height: 85px;
+      min-height: 90px;
       outline: none;
-      font-family: inherit;
+      transition: border 0.2s;
     }
-    textarea:focus, input:focus, select:focus {
-      border-color: var(--btn);
-    }
+    textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow); }
 
-    /* Блок помощи ИИ */
-    .ai-bar {
+    /* Панель ИИ */
+    .ai-row {
       display: flex;
       gap: 6px;
-      margin: 8px 0 12px 0;
+      margin: 10px 0 14px 0;
       overflow-x: auto;
-      padding-bottom: 2px;
+      scrollbar-width: none;
     }
-    .ai-chip {
-      background: rgba(46, 166, 255, 0.12);
-      color: var(--btn);
-      border: 1px solid rgba(46, 166, 255, 0.25);
+    .ai-row::-webkit-scrollbar { display: none; }
+    .ai-tag {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: #79c0ff;
+      padding: 6px 12px;
       border-radius: 20px;
-      padding: 5px 10px;
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 600;
       white-space: nowrap;
       cursor: pointer;
+      transition: all 0.15s;
     }
-    .ai-chip:active { opacity: 0.6; }
+    .ai-tag:active { transform: scale(0.95); background: rgba(46, 166, 255, 0.2); }
 
-    /* Кнопки действий */
-    .btn-row {
+    /* Кнопки управления */
+    .action-row {
       display: flex;
       gap: 8px;
     }
     .btn {
       flex: 1;
-      padding: 9px;
-      border-radius: 9px;
+      padding: 11px;
+      border-radius: 10px;
       border: none;
       font-size: 13px;
-      font-weight: 600;
+      font-weight: 700;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      transition: opacity 0.15s;
+      transition: all 0.15s;
     }
-    .btn:active { opacity: 0.7; }
-    .btn-save { background: var(--btn); color: var(--btn-text); }
-    .btn-send { background: rgba(76, 175, 80, 0.18); color: var(--success); }
-    .btn-del { background: rgba(239, 83, 80, 0.15); color: var(--danger); flex: 0.6; }
+    .btn:active { transform: scale(0.97); }
+    .btn-save { background: var(--accent); color: #fff; box-shadow: 0 3px 10px var(--accent-glow); }
+    .btn-send { background: rgba(0, 230, 118, 0.14); color: var(--success); border: 1px solid rgba(0, 230, 118, 0.3); }
+    .btn-del { background: rgba(255, 82, 82, 0.12); color: var(--danger); border: 1px solid rgba(255, 82, 82, 0.25); flex: 0.55; }
 
-    /* Форма добавления нового задания */
-    .form-group {
-      margin-bottom: 12px;
+    /* Модальное окно выбора предмета */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      z-index: 999;
+      display: none;
+      align-items: flex-end;
     }
-    .form-group label {
-      display: block;
-      font-size: 12px;
-      color: var(--hint);
-      margin-bottom: 6px;
-      font-weight: 600;
-    }
-    .form-group select, .form-group textarea {
+    .modal-overlay.active { display: flex; animation: fadeIn 0.2s ease; }
+    .sheet {
+      background: #18222e;
       width: 100%;
+      border-top-left-radius: 22px;
+      border-top-right-radius: 22px;
+      padding: 18px 16px 30px 16px;
+      max-height: 80vh;
+      overflow-y: auto;
+      border-top: 1px solid var(--border);
+      animation: slideUp 0.25s cubic-bezier(0.1, 0.9, 0.2, 1);
     }
-
-    /* Таблица расписания */
-    .sched-day {
-      background: var(--card-bg);
-      border-radius: 12px;
-      padding: 12px 14px;
-      margin-bottom: 10px;
-      border: 1px solid var(--border);
-    }
-    .sched-title {
-      font-size: 14px;
+    @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+    .sheet-title {
+      font-size: 16px;
       font-weight: 700;
-      color: var(--btn);
-      margin-bottom: 6px;
-    }
-    .sched-item {
-      font-size: 13px;
-      padding: 3px 0;
+      text-align: center;
+      margin-bottom: 16px;
       color: var(--text);
     }
-
-    /* Тост-уведомление */
-    .toast {
-      position: fixed;
-      bottom: 20px;
-      left: 50%;
-      transform: translateX(-50%) translateY(100px);
-      background: #2b394a;
-      color: #fff;
-      padding: 10px 18px;
-      border-radius: 25px;
+    .subj-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+    .subj-item {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 12px 10px;
+      border-radius: 12px;
       font-size: 13px;
       font-weight: 600;
-      box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .subj-item:active { background: var(--accent); color: #fff; transform: scale(0.97); }
+
+    /* Расписание */
+    .sched-card {
+      background: var(--card-bg);
+      border-radius: 14px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+    }
+    .sched-head {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .sched-line {
+      font-size: 13px;
+      padding: 4px 0;
+      color: var(--text);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+    }
+
+    /* Всплывающее уведомление */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: rgba(30, 41, 56, 0.96);
+      backdrop-filter: blur(10px);
+      color: #fff;
+      padding: 10px 22px;
+      border-radius: 30px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
       border: 1px solid var(--border);
       opacity: 0;
-      transition: all 0.25s ease;
-      z-index: 999;
+      transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      z-index: 1000;
       pointer-events: none;
     }
-    .toast.show {
-      transform: translateX(-50%) translateY(0);
-      opacity: 1;
-    }
-    .loading-spin {
-      text-align: center;
-      color: var(--hint);
-      padding: 30px;
-      font-size: 14px;
-    }
+    .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+    .status-msg { text-align: center; color: var(--hint); padding: 40px 10px; font-size: 14px; }
   </style>
 </head>
 <body>
 
-  <!-- Навигация вкладками -->
+  <!-- Вкладки меню -->
   <div class="nav">
     <button class="nav-btn active" onclick="switchTab('tasks')">Задания</button>
     <button class="nav-btn" onclick="switchTab('add')">+ Добавить ДЗ</button>
     <button class="nav-btn" onclick="switchTab('schedule')">Расписание</button>
   </div>
 
-  <!-- ВКЛАДКА 1: Список заданий -->
+  <!-- ВКЛАДКА 1: Список ДЗ -->
   <div id="tab-tasks" class="tab-content active">
-    <div id="tasks-list" class="loading-spin">Загрузка очереди...</div>
+    <div id="tasks-box" class="status-msg">Загрузка очереди...</div>
   </div>
 
-  <!-- ВКЛАДКА 2: Создание задания -->
+  <!-- ВКЛАДКА 2: Добавление задания -->
   <div id="tab-add" class="tab-content">
     <div class="card">
-      <div class="form-group">
-        <label>ПРЕДМЕТ</label>
-        <select id="new-subj">
-          <option value="Химия">Химия</option>
-          <option value="Рум. яз.">Рум. яз.</option>
-          <option value="Математика">Математика</option>
-          <option value="Литература">Литература</option>
-          <option value="История">История</option>
-          <option value="Физика">Физика</option>
-          <option value="Биология">Биология</option>
-          <option value="Англ. яз.">Англ. яз.</option>
-          <option value="Болг. яз.">Болг. яз.</option>
-          <option value="Рус. яз.">Рус. яз.</option>
-          <option value="Информ.">Информ.</option>
-          <option value="География">География</option>
-          <option value="РЛ">РЛ (Развитие личности)</option>
-          <option value="ГВ">ГВ</option>
-          <option value="Труд">Труд</option>
-          <option value="Физ. восп.">Физ. восп.</option>
-          <option value="Муз. восп.">Муз. восп.</option>
-        </select>
+      <div style="margin-bottom: 12px;">
+        <label style="font-size: 12px; color: var(--hint); font-weight: 600; margin-bottom: 6px; display: block;">ПРЕДМЕТ</label>
+        <div class="subj-pill" id="new-subj-btn" onclick="openPicker('new')">
+          <span id="new-subj-label">Химия</span> <span class="arrow">▼</span>
+        </div>
       </div>
-      <div class="form-group">
-        <label>ЧТО ЗАДАНО</label>
-        <textarea id="new-text" placeholder="Например: прочитать параграф 4, выполнить номера 12 и 14"></textarea>
+      <div style="margin-bottom: 8px;">
+        <label style="font-size: 12px; color: var(--hint); font-weight: 600; margin-bottom: 6px; display: block;">ЧТО ЗАДАНО</label>
+        <textarea id="new-task-text" placeholder="Напиши текст задания..."></textarea>
       </div>
-      <div class="ai-bar">
-        <div class="ai-chip" onclick="applyAiToNew('Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
-        <div class="ai-chip" onclick="applyAiToNew('Сделай короче')">✂️ Короче</div>
-        <div class="ai-chip" onclick="applyAiToNew('Разбей на пункты 1, 2, 3')">📋 Списком</div>
+      <div class="ai-row">
+        <div class="ai-tag" onclick="aiNew('Оформи красиво и понятно')">✨ Оформить ИИ</div>
+        <div class="ai-tag" onclick="aiNew('Сделай короче')">✂️ Короче</div>
+        <div class="ai-tag" onclick="aiNew('Разбей по пунктам 1, 2, 3')">📋 Списком</div>
       </div>
-      <button class="btn btn-save" style="width: 100%; padding: 12px; margin-top: 4px;" onclick="addNewTask()">Сохранить в очередь</button>
+      <button class="btn btn-save" style="width: 100%; padding: 13px;" onclick="saveNewTask()">Добавить в расписание</button>
     </div>
   </div>
 
   <!-- ВКЛАДКА 3: Расписание -->
   <div id="tab-schedule" class="tab-content">
-    <div id="schedule-box" class="loading-spin">Загрузка расписания...</div>
+    <div id="sched-box" class="status-msg">Загрузка расписания...</div>
+  </div>
+
+  <!-- Кастомный выбор предмета (Шторка снизу) -->
+  <div id="picker-modal" class="modal-overlay" onclick="closePicker()">
+    <div class="sheet" onclick="event.stopPropagation()">
+      <div class="sheet-title">Выбери предмет</div>
+      <div class="subj-grid" id="subj-grid-box"></div>
+    </div>
   </div>
 
   <div id="toast" class="toast">Сохранено</div>
 
   <script>
     const tg = window.Telegram?.WebApp;
-    if (tg) {
-      tg.ready();
-      tg.expand();
-    }
+    if (tg) { tg.ready(); tg.expand(); }
+
+    // Точный список предметов 8-Б класса со всеми уроками
+    const SUBJECTS = [
+      "Химия", "Рум. яз.", "ИКТ (ИКТБН)", "Математика", "Литература", 
+      "Физика", "Биология", "История", "Рус. яз.", "Англ. яз.", 
+      "Болг. яз.", "Информ.", "География", "РЛ (Развитие личности)", 
+      "ГВ", "Труд", "Физ. восп.", "Муз. восп."
+    ];
+
+    let currentPickerTarget = null; // 'new' или ID задачи
 
     function showToast(text) {
       const t = document.getElementById('toast');
       t.innerText = text;
       t.classList.add('show');
-      setTimeout(() => t.classList.remove('show'), 2200);
+      setTimeout(() => t.classList.remove('show'), 2000);
       if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
     }
 
@@ -364,64 +404,85 @@ WEBAPP_HTML = """<!DOCTYPE html>
       if (name === 'schedule') loadSchedule();
     }
 
-    const ALL_SUBJECTS = [
-      "Химия", "Рум. яз.", "Математика", "Литература", "История", "Физика", 
-      "Биология", "Англ. яз.", "Болг. яз.", "Рус. яз.", "Информ.", "География", 
-      "РЛ", "ГВ", "Труд", "Физ. восп.", "Муз. восп."
-    ];
+    // Инициализация шторки выбора предметов
+    function buildPickerGrid() {
+      const box = document.getElementById('subj-grid-box');
+      box.innerHTML = '';
+      SUBJECTS.forEach(s => {
+        const item = document.createElement('div');
+        item.className = 'subj-item';
+        item.innerText = s;
+        item.onclick = () => selectSubject(s);
+        box.appendChild(item);
+      });
+    }
+    buildPickerGrid();
+
+    function openPicker(targetId) {
+      currentPickerTarget = targetId;
+      document.getElementById('picker-modal').classList.add('active');
+    }
+
+    function closePicker() {
+      document.getElementById('picker-modal').classList.remove('active');
+    }
+
+    function selectSubject(subjName) {
+      if (currentPickerTarget === 'new') {
+        document.getElementById('new-subj-label').innerText = subjName;
+      } else {
+        document.getElementById('subj-label-' + currentPickerTarget).innerText = subjName;
+      }
+      closePicker();
+    }
 
     async function loadTasks() {
-      const container = document.getElementById('tasks-list');
+      const box = document.getElementById('tasks-box');
       try {
         const res = await fetch('/api/homework');
         const tasks = await res.json();
         if (!tasks || tasks.length === 0) {
-          container.innerHTML = '<div class="loading-spin">📭 Активных заданий нет.<br>Нажми «+ Добавить ДЗ» чтобы создать!</div>';
+          box.innerHTML = '<div class="status-msg">📭 В очереди нет активных заданий.<br>Нажми «+ Добавить ДЗ» чтобы создать!</div>';
           return;
         }
-        container.innerHTML = '';
+        box.innerHTML = '';
         tasks.forEach(t => {
           const card = document.createElement('div');
           card.className = 'card';
-          card.id = 'task-card-' + t.id;
+          card.id = 'task-box-' + t.id;
 
           let cleanText = t.task_text.replace(/<[^>]+>/g, '').trim();
 
-          let optionsHtml = '';
-          ALL_SUBJECTS.forEach(s => {
-            const sel = (s.toLowerCase() === t.subject.toLowerCase() || t.subject.toLowerCase().includes(s.toLowerCase())) ? 'selected' : '';
-            optionsHtml += `<option value="${s}" ${sel}>${s}</option>`;
-          });
-
           card.innerHTML = `
-            <div class="card-top">
-              <select class="subj-select" id="subj-${t.id}">
-                ${optionsHtml}
-              </select>
-              <div class="date-badge">${t.date_info}</div>
+            <div class="card-header">
+              <div class="subj-pill" onclick="openPicker(${t.id})">
+                <span id="subj-label-${t.id}">${t.subject}</span>
+                <span class="arrow">▼</span>
+              </div>
+              <div class="date-info">${t.date_info}</div>
             </div>
             <textarea id="text-${t.id}">${cleanText}</textarea>
-            <div class="ai-bar">
-              <div class="ai-chip" onclick="applyAiToTask(${t.id}, 'Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
-              <div class="ai-chip" onclick="applyAiToTask(${t.id}, 'Сделай короче')">✂️ Короче</div>
-              <div class="ai-chip" onclick="applyAiToTask(${t.id}, 'Разбей по пунктам')">📋 Списком</div>
+            <div class="ai-row">
+              <div class="ai-tag" onclick="aiTask(${t.id}, 'Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
+              <div class="ai-tag" onclick="aiTask(${t.id}, 'Сделай короче')">✂️ Короче</div>
+              <div class="ai-tag" onclick="aiTask(${t.id}, 'Разбей по пунктам')">📋 Списком</div>
             </div>
-            <div class="btn-row">
+            <div class="action-row">
               <button class="btn btn-del" onclick="deleteTask(${t.id})">Удалить</button>
-              <button class="btn btn-send" onclick="sendNow(${t.id})">В чат</button>
+              <button class="btn btn-send" onclick="sendTaskNow(${t.id})">В чат</button>
               <button class="btn btn-save" onclick="saveTask(${t.id})">Сохранить</button>
             </div>
           `;
-          container.appendChild(card);
+          box.appendChild(card);
         });
       } catch (e) {
-        container.innerHTML = '<div class="loading-spin">Ошибка загрузки. Проверь соединение.</div>';
+        box.innerHTML = '<div class="status-msg">Ошибка загрузки очереди.</div>';
       }
     }
 
     async function saveTask(id) {
       const text = document.getElementById('text-' + id).value.trim();
-      const subject = document.getElementById('subj-' + id).value;
+      const subject = document.getElementById('subj-label-' + id).innerText;
       if (!text) { alert('Текст не может быть пустым'); return; }
 
       try {
@@ -446,14 +507,14 @@ WEBAPP_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.ok) {
-          document.getElementById('task-card-' + id)?.remove();
+          document.getElementById('task-box-' + id)?.remove();
           showToast('Удалено');
           if (document.querySelectorAll('.card').length === 0) loadTasks();
         }
       } catch (e) { alert('Ошибка при удалении'); }
     }
 
-    async function sendNow(id) {
+    async function sendTaskNow(id) {
       try {
         const res = await fetch('/api/send_item', {
           method: 'POST',
@@ -465,13 +526,13 @@ WEBAPP_HTML = """<!DOCTYPE html>
       } catch (e) { alert('Ошибка отправки'); }
     }
 
-    async function applyAiToTask(id, instruction) {
+    async function aiTask(id, instruction) {
       const textarea = document.getElementById('text-' + id);
-      const subject = document.getElementById('subj-' + id).value;
+      const subject = document.getElementById('subj-label-' + id).innerText;
       const original = textarea.value.trim();
       if (!original) return;
 
-      textarea.value = 'ИИ думает...';
+      textarea.value = 'ИИ формулирует задание...';
       try {
         const res = await fetch('/api/ai', {
           method: 'POST',
@@ -481,23 +542,20 @@ WEBAPP_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (data.ok) {
           textarea.value = data.text;
-          showToast('ИИ переписал текст');
+          showToast('ИИ оформил текст');
         } else {
           textarea.value = original;
-          alert('ИИ временно недоступен');
         }
-      } catch (e) {
-        textarea.value = original;
-      }
+      } catch (e) { textarea.value = original; }
     }
 
-    async function applyAiToNew(instruction) {
-      const textarea = document.getElementById('new-text');
-      const subject = document.getElementById('new-subj').value;
+    async function aiNew(instruction) {
+      const textarea = document.getElementById('new-task-text');
+      const subject = document.getElementById('new-subj-label').innerText;
       const original = textarea.value.trim();
-      if (!original) { alert('Сначала напиши текст задания'); return; }
+      if (!original) { alert('Сначала напиши черновик задания'); return; }
 
-      textarea.value = 'ИИ думает...';
+      textarea.value = 'ИИ формулирует задание...';
       try {
         const res = await fetch('/api/ai', {
           method: 'POST',
@@ -507,18 +565,16 @@ WEBAPP_HTML = """<!DOCTYPE html>
         const data = await res.json();
         if (data.ok) {
           textarea.value = data.text;
-          showToast('ИИ оформил задание');
+          showToast('ИИ оформил текст');
         } else {
           textarea.value = original;
         }
-      } catch (e) {
-        textarea.value = original;
-      }
+      } catch (e) { textarea.value = original; }
     }
 
-    async function addNewTask() {
-      const subject = document.getElementById('new-subj').value;
-      const text = document.getElementById('new-text').value.trim();
+    async function saveNewTask() {
+      const subject = document.getElementById('new-subj-label').innerText;
+      const text = document.getElementById('new-task-text').value.trim();
       if (!text) { alert('Напиши текст задания'); return; }
 
       try {
@@ -529,11 +585,9 @@ WEBAPP_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.ok) {
-          document.getElementById('new-text').value = '';
+          document.getElementById('new-task-text').value = '';
           showToast('Задание добавлено в очередь!');
-          setTimeout(() => {
-            document.querySelectorAll('.nav-btn')[0].click();
-          }, 400);
+          setTimeout(() => { document.querySelectorAll('.nav-btn')[0].click(); }, 350);
         } else {
           alert('Ошибка при добавлении');
         }
@@ -541,23 +595,23 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function loadSchedule() {
-      const box = document.getElementById('schedule-box');
+      const box = document.getElementById('sched-box');
       try {
         const res = await fetch('/api/schedule');
         const sched = await res.json();
         const days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница"];
         let html = '';
         days.forEach((dayName, idx) => {
-          html += `<div class="sched-day"><div class="sched-title">${dayName}</div>`;
+          html += `<div class="sched-card"><div class="sched-head">${dayName}</div>`;
           const items = sched[idx] || [];
           items.forEach((item, num) => {
-            html += `<div class="sched-item">${num + 1}. ${item.charAt(0).toUpperCase() + item.slice(1)}</div>`;
+            html += `<div class="sched-line">${num + 1}. ${item.charAt(0).toUpperCase() + item.slice(1)}</div>`;
           });
           html += `</div>`;
         });
         box.innerHTML = html;
       } catch (e) {
-        box.innerHTML = '<div class="loading-spin">Ошибка загрузки расписания</div>';
+        box.innerHTML = '<div class="status-msg">Ошибка загрузки расписания</div>';
       }
     }
 
@@ -582,7 +636,6 @@ class EditHW(StatesGroup):
     waiting_for_subject = State()
     waiting_for_ai_prompt = State()
 
-# --- МАРШРУТЫ ДЛЯ WEB APP ---
 async def web_handle(request):
     return web.Response(text=WEBAPP_HTML, content_type="text/html")
 
@@ -624,7 +677,7 @@ async def api_save_homework(request):
                 await db.commit()
         else:
             async with aiosqlite.connect("school.db") as db:
-                await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
+                await db.execute("UPDATE homework SET task_text = ?, subject = ? WHERE id = ?", (formatted, new_subj.capitalize(), hw_id))
                 await db.commit()
 
         await sync_backup()
@@ -774,6 +827,7 @@ async def restore_from_backup():
                                 (item.get("id"), item["subject"].capitalize(), clean_text, item["photo_id"], item["send_date"])
                             )
                 await db.commit()
+            print("База восстановлена из резервной копии.")
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
@@ -922,7 +976,8 @@ def normalize_subject(name: str) -> str:
         "био": "биология",
         "хим": "химия",
         "гео": "география",
-        "инф": "информ.", "информатика": "информ.", "икт": "иктбн",
+        "инф": "информ.", "информатика": "информ.",
+        "икт": "иктбн", "иктбн": "иктбн",
         "ист": "история",
         "англ": "англ. яз.", "английский": "англ. яз.",
         "физра": "физ. восп.", "физкультура": "физ. восп.",
@@ -1072,7 +1127,6 @@ async def view_homework_cmd(msg: Message):
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
 
-# ОФИЦИАЛЬНОЕ СООБЩЕНИЕ ДЛЯ ГРУППЫ: СТРОГО БЕЗ СМАЙЛИКОВ И БЕЗ КАПСА
 async def send_hw_item(subject: str, task_text: str, photo_field: str | None):
     photos = get_photo_list(photo_field)
     
