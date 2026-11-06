@@ -52,15 +52,16 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# Буфер для сборки альбомов (2 и более фото)
 media_group_cache = {}
 
+# is_persistent=True делает меню вечным (оно не скрывается и не пропадает)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Список ДЗ"), KeyboardButton(text="Расписание")],
         [KeyboardButton(text="Отправить сейчас"), KeyboardButton(text="Отмена")]
     ],
-    resize_keyboard=True
+    resize_keyboard=True,
+    is_persistent=True
 )
 
 class EditHW(StatesGroup):
@@ -134,30 +135,35 @@ async def restore_from_backup():
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
-async def fix_all_dates():
+# Обновляет все старые задания в базе, чтобы у всех была правильная цитата
+async def fix_database_quotes_and_dates():
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT id, subject FROM homework WHERE is_sent = 0") as cursor:
+        async with db.execute("SELECT id, subject, task_text FROM homework WHERE is_sent = 0") as cursor:
             rows = await cursor.fetchall()
             for r in rows:
+                t = r["task_text"]
+                # Если в тексте еще нет цитаты — оборачиваем
+                if "<blockquote>" not in t:
+                    clean = t.replace("📸 ", "").replace(" 👆", "").strip()
+                    t = f"<blockquote>{clean}</blockquote>"
+                
                 lesson_d, _ = find_next_lesson_date(r["subject"])
                 if lesson_d:
                     reminder_d = lesson_d - timedelta(days=1)
                     await db.execute(
-                        "UPDATE homework SET send_date = ? WHERE id = ?",
-                        (reminder_d.strftime("%Y-%m-%d"), r["id"])
+                        "UPDATE homework SET task_text = ?, send_date = ? WHERE id = ?",
+                        (t, reminder_d.strftime("%Y-%m-%d"), r["id"])
                     )
         await db.commit()
     await sync_backup()
 
-# Красивое разбиение подписей к фото на цитаты (Первое фото, Второе фото)
 def format_task_text(task_raw: str, num_photos: int) -> str:
     if not task_raw:
         return "<blockquote>Задание на фото с доски.</blockquote>" if num_photos > 0 else ""
 
     lines = [line.strip() for line in task_raw.strip().split("\n") if line.strip()]
     
-    # Паттерн для поиска "#1 фото", "1 фото", "фото 1"
     pattern = re.compile(
         r'^(?:#?\s*(\d+)\s*(?:фото|photo)|(?:фото|photo)\s*#?\s*(\d+))\s*[:,\-]?\s*(.*)$',
         re.IGNORECASE
@@ -201,6 +207,7 @@ def format_task_text(task_raw: str, num_photos: int) -> str:
         
         return "\n\n".join(output_parts)
     else:
+        # Для обычного текста без номеров фото — всегда делаем красивую цитату
         return f"<blockquote>{html.escape(task_raw)}</blockquote>"
 
 def get_photo_list(photo_field: str | None) -> list[str]:
@@ -219,12 +226,14 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
     if not key:
         return raw_task
 
+    # Убираем теги для отправки в ИИ
+    clean_task = re.sub(r'<[^>]+>', '', raw_task).strip()
     user_note = f"\nПожелание: {user_instruction}" if user_instruction else ""
 
     prompt = f"""Ты школьный помощник. Перепиши текст домашнего задания так, чтобы оно было аккуратным, понятным и готовым для отправки в беседу класса.
 
 Предмет: {subject}
-Черновик: {raw_task}{user_note}
+Черновик: {clean_task}{user_note}
 
 Инструкция:
 1. Исправь орфографические и пунктуационные ошибки.
@@ -257,7 +266,7 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
     except Exception as e:
         logging.error(f"Ошибка вызова ИИ: {e}")
 
-    return raw_task
+    return clean_task
 
 def normalize_subject(name: str) -> str:
     s = name.strip().lower()
@@ -318,14 +327,14 @@ async def start_cmd(msg: Message):
         return
     await msg.answer(
         "Бот 8-Б класса готов к работе.\n\n"
-        "Кнопки меню:\n"
-        "• Список ДЗ — просмотр очереди заданий\n"
+        "Кнопки меню закреплены снизу:\n"
+        "• Список ДЗ — просмотр заданий\n"
         "• Расписание — уроки на неделю\n"
-        "• Отправить сейчас — выгрузить задания прямо сейчас\n"
-        "• Отмена — сбросить редактирование\n\n"
+        "• Отправить сейчас — выгрузить задания\n"
+        "• Отмена — сбросить действие\n\n"
         "Отправка заданий:\n"
         "• Текстом: Румынский: выучить слова на стр 15\n"
-        "• Фото (можно сразу 1 или 2 фото): прикрепи фото с названием предмета (например, Химия)",
+        "• Фото (1 или альбом): фото с названием предмета (например, Химия)",
         reply_markup=MAIN_KEYBOARD
     )
 
@@ -346,10 +355,10 @@ async def cancel_fsm(msg: Message, state: FSMContext):
 async def view_schedule_cmd(msg: Message):
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
-    lines = ["Расписание 8-Б класса:\n"]
+    lines = ["<b>Расписание 8-Б класса:</b>\n"]
     for day_idx in range(5):
         day_name = DAYS_MAP[day_idx].capitalize()
-        lines.append(f"{day_name}:")
+        lines.append(f"<b>{day_name}:</b>")
         for num, subj in enumerate(SCHEDULE[day_idx], start=1):
             lines.append(f"  {num}. {html.escape(subj.capitalize())}")
         lines.append("")
@@ -382,13 +391,19 @@ async def view_homework_cmd(msg: Message):
         lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
         photos = get_photo_list(row["photo_id"])
+        
+        # Гарантируем цитирование текста
+        task_display = row["task_text"]
+        if "<blockquote>" not in task_display:
+            task_display = f"<blockquote>{html.escape(task_display)}</blockquote>"
+
         card_text = (
-            f"Задание {idx} из {total}\n"
-            f"Предмет: <b>{html.escape(row['subject'])}</b>\n"
-            f"Урок будет: <b>{lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}</b>\n"
-            f"Отправка: <b>{send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30</b> (накануне)\n\n"
-            f"Текст:\n"
-            f"{row['task_text']}"
+            f"<b>Задание {idx} из {total}</b>\n"
+            f"<b>Предмет:</b> {html.escape(row['subject'])}\n"
+            f"<b>Урок:</b> {lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}\n"
+            f"<b>Отправка:</b> {send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:30 (накануне)\n\n"
+            f"<b>Задание:</b>\n"
+            f"{task_display}"
         )
 
         kb = make_hw_kb(row["id"])
@@ -400,13 +415,17 @@ async def view_homework_cmd(msg: Message):
         else:
             await msg.answer(text=card_text, reply_markup=kb, parse_mode="HTML")
 
-# Отправка задания (одиночного или с пачкой фото)
 async def send_hw_item(subject: str, task_text: str, photo_field: str | None):
     photos = get_photo_list(photo_field)
+    
+    task_display = task_text
+    if "<blockquote>" not in task_display:
+        task_display = f"<blockquote>{html.escape(task_display)}</blockquote>"
+
     header = (
         f"<b>ДОМАШНЕЕ ЗАДАНИЕ НА ЗАВТРА</b>\n"
         f"<b>Предмет:</b> {html.escape(subject)}\n\n"
-        f"{task_text}"
+        f"{task_display}"
     )
 
     if not photos:
@@ -465,7 +484,6 @@ async def edit_text_finish(msg: Message, state: FSMContext):
     data = await state.get_data()
     hw_id = data["hw_id"]
 
-    # Форматируем новый текст в цитаты
     formatted = format_task_text(new_text, 1)
 
     async with aiosqlite.connect("school.db") as db:
@@ -475,7 +493,7 @@ async def edit_text_finish(msg: Message, state: FSMContext):
     await state.clear()
     
     await msg.answer(
-        f"Текст задания обновлен:\n\n{formatted}",
+        f"<b>Текст задания обновлен:</b>\n\n{formatted}",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -520,7 +538,7 @@ async def ai_edit_finish(msg: Message, state: FSMContext):
     await state.clear()
 
     await msg.answer(
-        f"Результат от ИИ:\n\n{formatted}",
+        f"<b>Результат от ИИ:</b>\n\n{formatted}",
         reply_markup=MAIN_KEYBOARD,
         parse_mode="HTML"
     )
@@ -568,10 +586,8 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# Прием домашних заданий (сборка альбомов из 2 фото, без авто-ИИ)
 @dp.message(StateFilter(None), F.from_user.id == ADMIN_CHAT_ID)
 async def handle_homework(msg: Message):
-    # Если пришел альбом из нескольких фото
     if msg.media_group_id:
         mg_id = msg.media_group_id
         if mg_id not in media_group_cache:
@@ -586,7 +602,6 @@ async def handle_homework(msg: Message):
             if msg.caption:
                 media_group_cache[mg_id]["caption"] = msg.caption
 
-        # Ждем 1 секунду, чтобы все части альбома дошли
         await asyncio.sleep(1.0)
 
         if mg_id in media_group_cache:
@@ -595,17 +610,15 @@ async def handle_homework(msg: Message):
             raw_text = (data["caption"] or "").strip()
             msg = data["msg"]
         else:
-            # Уже обработано соседней задачей альбома
             return
     else:
         photos = [msg.photo[-1].file_id] if msg.photo else []
         raw_text = (msg.caption if msg.photo else (msg.text or "")).strip()
 
     if photos and not raw_text:
-        await msg.answer("Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: Химия).")
+        await msg.answer("Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: Химия).", reply_markup=MAIN_KEYBOARD)
         return
 
-    # Разбираем предмет и подпись
     if ":" in raw_text:
         subject, task = raw_text.split(":", 1)
         subject, task = subject.strip(), task.strip()
@@ -614,10 +627,9 @@ async def handle_homework(msg: Message):
 
     lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(f"Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", parse_mode="HTML")
+        await msg.answer(f"Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
         return
 
-    # Форматируем подпись красиво по цитатам БЕЗ автоматического вмешательства ИИ
     final_text = format_task_text(task, len(photos))
 
     reminder_date = lesson_date - timedelta(days=1)
@@ -638,11 +650,11 @@ async def handle_homework(msg: Message):
     lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
     
     confirm = (
-        f"Задание сохранено.\n\n"
-        f"Предмет: <b>{html.escape(matched_name)}</b>\n"
-        f"Урок будет: <b>{lesson_weekday}, {lesson_date.strftime('%d.%m')}</b>\n"
-        f"Отправка: <b>{send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30</b> (накануне урока)\n\n"
-        f"Текст для отправки:\n"
+        f"<b>Задание сохранено.</b>\n\n"
+        f"<b>Предмет:</b> {html.escape(matched_name)}\n"
+        f"<b>Урок:</b> {lesson_weekday}, {lesson_date.strftime('%d.%m')}\n"
+        f"<b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:30 (накануне урока)\n\n"
+        f"<b>Задание:</b>\n"
         f"{final_text}"
     )
 
@@ -656,7 +668,6 @@ async def handle_homework(msg: Message):
     else:
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
 
-# Функция отправки по расписанию или кнопке
 async def send_due_homework(force_resend: bool = False) -> int:
     now_md = datetime.now(TZ)
     today_str = now_md.strftime("%Y-%m-%d")
@@ -703,7 +714,7 @@ async def main():
     await init_db()
     await start_web_server()
     await restore_from_backup()
-    await fix_all_dates()
+    await fix_database_quotes_and_dates()
     
     scheduler.add_job(send_due_homework, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
