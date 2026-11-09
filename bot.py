@@ -68,7 +68,17 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 media_group_cache = {}
 
-# Определение целевого учебного дня (Завтра или Понедельник)
+# Состояния FSM
+class AdminStates(StatesGroup):
+    waiting_for_reply = State()
+    waiting_for_broadcast = State()
+
+class EditHW(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_subject = State()
+    waiting_for_ai_prompt = State()
+
+# Определение даты следующего учебного дня (Завтра или Понедельник)
 def get_target_lesson_date() -> tuple[datetime.date, str]:
     now = datetime.now(TZ)
     today = now.date()
@@ -89,13 +99,13 @@ def get_target_lesson_date() -> tuple[datetime.date, str]:
         
     return target, day_text
 
-# ВЕБ-ПРИЛОЖЕНИЕ: ИСПРАВЛЕННЫЙ ДНЕВНИК И ОЧЕРЕДЬ
+# ВЕБ-ПРИЛОЖЕНИЕ: СТРОГО ДЛЯ АДМИНА
 WEBAPP_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Электронный Дневник 8-Б</title>
+  <title>Школьный Секретарь 8-Б</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root {
@@ -130,10 +140,9 @@ WEBAPP_HTML = """<!DOCTYPE html>
       padding: 3px 8px;
       border-radius: 8px;
       font-weight: 600;
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--hint);
+      background: rgba(46, 166, 255, 0.18);
+      color: var(--accent);
     }
-    .role-admin { background: rgba(46, 166, 255, 0.18); color: var(--accent); }
 
     .nav {
       display: flex;
@@ -195,12 +204,15 @@ WEBAPP_HTML = """<!DOCTYPE html>
       display: inline-flex;
       align-items: center;
       gap: 6px;
+      cursor: pointer;
     }
-    .subj-pill.clickable { cursor: pointer; }
+    .subj-pill:active { transform: scale(0.96); }
     .date-badge {
       font-size: 12px;
       color: var(--hint);
       text-align: right;
+      cursor: pointer;
+      text-decoration: underline dotted;
     }
 
     .dates-slider {
@@ -244,17 +256,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
       outline: none;
     }
     textarea:focus { border-color: var(--accent); }
-
-    .readonly-box {
-      background: var(--input-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-      font-size: 14px;
-      line-height: 1.45;
-      color: var(--text);
-      white-space: pre-wrap;
-    }
 
     .ai-row {
       display: flex;
@@ -405,33 +406,33 @@ WEBAPP_HTML = """<!DOCTYPE html>
 <body>
 
   <div class="header-bar">
-    <div class="header-title">Дневник 8-Б</div>
-    <div id="role-badge" class="role-badge">Загрузка...</div>
+    <div class="header-title">Панель Старосты 8-Б</div>
+    <div class="role-badge">Администратор</div>
   </div>
 
   <div class="nav" id="main-nav">
-    <button class="nav-btn active" id="btn-tasks" onclick="switchTab('tasks')">Завтра</button>
+    <button class="nav-btn active" id="btn-tasks" onclick="switchTab('tasks')">Очередь</button>
     <button class="nav-btn" id="btn-diary" onclick="switchTab('diary')">📖 Дневник</button>
-    <button class="nav-btn" id="nav-btn-add" onclick="switchTab('add')">+ Добавить</button>
+    <button class="nav-btn" id="btn-add" onclick="switchTab('add')">+ Добавить</button>
     <button class="nav-btn" id="btn-schedule" onclick="switchTab('schedule')">Расписание</button>
   </div>
 
-  <!-- ВКЛАДКА 1: Задания на ближайший урок -->
+  <!-- ВКЛАДКА 1: Все активные задания очереди -->
   <div id="tab-tasks" class="tab-content active">
-    <div id="tasks-box" class="status-msg">Загрузка...</div>
+    <div id="tasks-box" class="status-msg">Загрузка очереди...</div>
   </div>
 
-  <!-- ВКЛАДКА 2: Электронный Дневник по дням недели -->
+  <!-- ВКЛАДКА 2: Электронный Дневник (История по дням) -->
   <div id="tab-diary" class="tab-content">
     <div id="diary-box" class="status-msg">Загрузка дневника...</div>
   </div>
 
-  <!-- ВКЛАДКА 3: Добавление задания (Админ) -->
+  <!-- ВКЛАДКА 3: Добавление задания с фото и датой -->
   <div id="tab-add" class="tab-content">
     <div class="card">
       <div style="margin-bottom: 12px;">
         <label style="font-size: 12px; color: var(--hint); font-weight: 600; margin-bottom: 6px; display: block;">ПРЕДМЕТ</label>
-        <div class="subj-pill clickable" onclick="openPicker('new')">
+        <div class="subj-pill" onclick="openPicker('new')">
           <span id="new-subj-label">Химия</span> <span style="font-size:10px;">▼</span>
         </div>
       </div>
@@ -480,7 +481,17 @@ WEBAPP_HTML = """<!DOCTYPE html>
 
     const ADMIN_USER_ID = 6243658367;
     const currentUserId = tg?.initDataUnsafe?.user?.id || 0;
-    const isAdmin = (currentUserId === ADMIN_USER_ID || currentUserId === 0);
+
+    // СТРОГАЯ БЛОКИРОВКА ДЛЯ ЧУЖИХ
+    if (currentUserId !== ADMIN_USER_ID && currentUserId !== 0) {
+      document.body.innerHTML = `
+        <div style="text-align:center; padding:60px 20px; font-family:sans-serif;">
+          <h2 style="color:#ff5252; margin-bottom:8px;">⛔️ Доступ ограничен</h2>
+          <p style="color:#8b9bb4; font-size:14px; line-height:1.5;">Веб-панель предназначена только для старосты класса.<br>Ученики смотрят домашку через кнопки в чате бота.</p>
+        </div>
+      `;
+      throw new Error("Access Denied");
+    }
 
     const SUBJECTS = [
       "Химия", "Рум. яз.", "ИКТ (ИКТБН)", "Математика", "Литература", 
@@ -493,19 +504,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     let newUploadedPhotos = [];
     let selectedLessonDateNew = null;
     let selectedReminderDateNew = null;
-
-    function initUserRole() {
-      const badge = document.getElementById('role-badge');
-      const addNavBtn = document.getElementById('nav-btn-add');
-      if (isAdmin) {
-        badge.innerText = 'Староста (Админ)';
-        badge.classList.add('role-admin');
-      } else {
-        badge.innerText = 'Режим ученика';
-        if (addNavBtn) addNavBtn.style.display = 'none';
-      }
-    }
-    initUserRole();
 
     function showToast(text) {
       const t = document.getElementById('toast');
@@ -540,7 +538,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     buildPickerGrid();
 
     function openPicker(targetId) {
-      if (!isAdmin) return;
       currentPickerTarget = targetId;
       document.getElementById('picker-modal').classList.add('active');
     }
@@ -661,22 +658,19 @@ WEBAPP_HTML = """<!DOCTYPE html>
       renderNewPhotoPreviews();
     }
 
-    // 1. ЗАГРУЗКА ТОЛЬКО ЗАДАНИЙ НА СЛЕДУЮЩИЙ УЧЕБНЫЙ ДЕНЬ
+    // 1. ЗАГРУЗКА ВСЕЙ ОЧЕРЕДИ ЗАДАНИЙ ДЛЯ СТАРОСТЫ
     async function loadTasks() {
       const box = document.getElementById('tasks-box');
       try {
         const res = await fetch('/api/homework?user_id=' + currentUserId);
         const data = await res.json();
         const tasks = data.tasks || [];
-        const targetTitle = data.target_title || "на следующий урок";
-
-        document.getElementById('btn-tasks').innerText = data.short_title || "Завтра";
 
         if (!tasks || tasks.length === 0) {
-          box.innerHTML = `<div class="status-msg">📭 Домашних заданий ${targetTitle} нет.<br>Открой вкладку «Дневник», чтобы посмотреть другие дни!</div>`;
+          box.innerHTML = '<div class="status-msg">📭 В очереди нет заданий.<br>Нажми «+ Добавить» или посмотри «Дневник»!</div>';
           return;
         }
-        box.innerHTML = `<div style="font-size:13px; font-weight:700; color:var(--accent); margin-bottom:10px;">Задания ${targetTitle}:</div>`;
+        box.innerHTML = `<div style="font-size:13px; font-weight:700; color:var(--hint); margin-bottom:12px;">Всего в очереди: ${tasks.length} предм.</div>`;
         
         for (const t of tasks) {
           const card = document.createElement('div');
@@ -685,39 +679,29 @@ WEBAPP_HTML = """<!DOCTYPE html>
 
           let cleanText = t.task_text.replace(/<[^>]+>/g, '').trim();
 
-          if (isAdmin) {
-            card.innerHTML = `
-              <div class="card-top">
-                <div class="subj-pill clickable" onclick="openPicker(${t.id})">
-                  <span id="subj-label-${t.id}">${t.subject}</span>
-                  <span style="font-size:10px;">▼</span>
-                </div>
-                <div class="date-badge" onclick="toggleDateEdit(${t.id}, '${t.subject}')">
-                  ${t.date_info} ✏️
-                </div>
+          card.innerHTML = `
+            <div class="card-top">
+              <div class="subj-pill" onclick="openPicker(${t.id})">
+                <span id="subj-label-${t.id}">${t.subject}</span>
+                <span style="font-size:10px;">▼</span>
               </div>
-              <div id="card-dates-${t.id}" class="dates-slider" style="display:none;" data-lesson-date="${t.lesson_date || ''}" data-reminder-date="${t.send_date}"></div>
-              <textarea id="text-${t.id}">${cleanText}</textarea>
-              <div class="ai-row">
-                <div class="ai-tag" onclick="aiTask(${t.id}, 'Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
-                <div class="ai-tag" onclick="aiTask(${t.id}, 'Сделай короче')">✂️ Короче</div>
-                <div class="ai-tag" onclick="aiTask(${t.id}, 'Разбей по пунктам')">📋 Списком</div>
+              <div class="date-badge" onclick="toggleDateEdit(${t.id}, '${t.subject}')">
+                ${t.date_info} ✏️
               </div>
-              <div class="action-row">
-                <button class="btn btn-del" onclick="deleteTask(${t.id})">Удалить</button>
-                <button class="btn btn-send" onclick="sendTaskNow(${t.id})">В чат</button>
-                <button class="btn btn-save" onclick="saveTask(${t.id})">Сохранить</button>
-              </div>
-            `;
-          } else {
-            card.innerHTML = `
-              <div class="card-top">
-                <div class="subj-pill"><span>${t.subject}</span></div>
-                <div class="date-badge">${t.date_info}</div>
-              </div>
-              <div class="readonly-box">${cleanText}</div>
-            `;
-          }
+            </div>
+            <div id="card-dates-${t.id}" class="dates-slider" style="display:none;" data-lesson-date="${t.lesson_date || ''}" data-reminder-date="${t.send_date}"></div>
+            <textarea id="text-${t.id}">${cleanText}</textarea>
+            <div class="ai-row">
+              <div class="ai-tag" onclick="aiTask(${t.id}, 'Оформи аккуратно и понятно')">✨ Оформить ИИ</div>
+              <div class="ai-tag" onclick="aiTask(${t.id}, 'Сделай короче')">✂️ Короче</div>
+              <div class="ai-tag" onclick="aiTask(${t.id}, 'Разбей по пунктам')">📋 Списком</div>
+            </div>
+            <div class="action-row">
+              <button class="btn btn-del" onclick="deleteTask(${t.id})">Удалить</button>
+              <button class="btn btn-send" onclick="sendTaskNow(${t.id})">В чат</button>
+              <button class="btn btn-save" onclick="saveTask(${t.id})">Сохранить</button>
+            </div>
+          `;
           box.appendChild(card);
         }
       } catch (e) {
@@ -725,7 +709,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
       }
     }
 
-    // 2. ИСПРАВЛЕННЫЙ ЭЛЕКТРОННЫЙ ДНЕВНИК ПО ДНЯМ
+    // 2. ЭЛЕКТРОННЫЙ ДНЕВНИК ПО ДНЯМ
     async function loadDiary() {
       const box = document.getElementById('diary-box');
       box.innerHTML = '<div class="status-msg">Загрузка электронного дневника...</div>';
@@ -733,7 +717,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
         const res = await fetch('/api/diary');
         const diaryDays = await res.json();
         if (!diaryDays || diaryDays.length === 0) {
-          box.innerHTML = '<div class="status-msg">📖 В дневнике пока нет сохраненных записей.</div>';
+          box.innerHTML = '<div class="status-msg">📖 В дневнике пока нет записей.</div>';
           return;
         }
         box.innerHTML = '';
@@ -748,11 +732,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
               : '<span class="status-chip status-pending">В очереди</span>';
 
             let cleanTask = task.task_text.replace(/<[^>]+>/g, '').trim();
-            let adminBtn = isAdmin 
-              ? `<div style="margin-top: 8px; display: flex; justify-content: flex-end;">
-                   <button class="btn btn-send" style="padding: 6px 12px; font-size: 11px; flex: initial;" onclick="sendTaskNow(${task.id})">Выгрузить в чат</button>
-                 </div>`
-              : '';
 
             tasksHtml += `
               <div class="diary-task-item">
@@ -761,7 +740,9 @@ WEBAPP_HTML = """<!DOCTYPE html>
                   <div>${statusHtml}</div>
                 </div>
                 <div class="diary-text">${cleanTask}</div>
-                ${adminBtn}
+                <div style="margin-top: 8px; display: flex; justify-content: flex-end;">
+                  <button class="btn btn-send" style="padding: 6px 12px; font-size: 11px; flex: initial;" onclick="sendTaskNow(${task.id})">Выгрузить в чат</button>
+                </div>
               </div>
             `;
           });
@@ -781,7 +762,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function toggleDateEdit(taskId, subj) {
-      if (!isAdmin) return;
       const slider = document.getElementById('card-dates-' + taskId);
       if (slider.style.display === 'none') {
         slider.style.display = 'flex';
@@ -792,7 +772,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function saveTask(id) {
-      if (!isAdmin) return;
       const text = document.getElementById('text-' + id).value.trim();
       const subject = document.getElementById('subj-label-' + id).innerText;
       const slider = document.getElementById('card-dates-' + id);
@@ -816,7 +795,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function deleteTask(id) {
-      if (!isAdmin) return;
       if (!confirm('Удалить это задание из очереди?')) return;
       try {
         const res = await fetch('/api/delete', {
@@ -834,7 +812,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function sendTaskNow(id) {
-      if (!isAdmin) return;
       try {
         const res = await fetch('/api/send_item', {
           method: 'POST',
@@ -847,7 +824,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function aiTask(id, instruction) {
-      if (!isAdmin) return;
       const textarea = document.getElementById('text-' + id);
       const subject = document.getElementById('subj-label-' + id).innerText;
       const original = textarea.value.trim();
@@ -869,7 +845,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function aiNew(instruction) {
-      if (!isAdmin) return;
       const textarea = document.getElementById('new-task-text');
       const subject = document.getElementById('new-subj-label').innerText;
       const original = textarea.value.trim();
@@ -891,7 +866,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     async function saveNewTask() {
-      if (!isAdmin) return;
       const subject = document.getElementById('new-subj-label').innerText;
       const text = document.getElementById('new-task-text').value.trim();
       if (!text && newUploadedPhotos.length === 0) { alert('Напиши задание или прикрепи фото!'); return; }
@@ -932,9 +906,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
           const items = sched[idx] || [];
           items.forEach((item, num) => {
             const formattedItem = item.charAt(0).toUpperCase() + item.slice(1);
-            let actionBtn = isAdmin ? `<span style="font-size:11px; color:var(--accent);">➕ ДЗ</span>` : '';
-            let clickAttr = isAdmin ? `onclick="addFromSchedule('${formattedItem}')"` : '';
-            html += `<div class="sched-line" ${clickAttr}><span>${num + 1}. ${formattedItem}</span> ${actionBtn}</div>`;
+            html += `<div class="sched-line" onclick="addFromSchedule('${formattedItem}')"><span>${num + 1}. ${formattedItem}</span> <span style="font-size:11px; color:var(--accent);">➕ ДЗ</span></div>`;
           });
           html += `</div>`;
         });
@@ -945,50 +917,38 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     function addFromSchedule(subj) {
-      if (!isAdmin) return;
       document.querySelectorAll('.nav-btn')[2].click();
       document.getElementById('new-subj-label').innerText = subj;
       refreshNewDates(subj);
     }
 
-    // Если открыли по кнопке дневника (?tab=diary) — сразу открываем Дневник
-    const urlParams = new URLSearchParams(window.location.search);
-    if (urlParams.get('tab') === 'diary') {
-      switchTab('diary');
-    } else {
-      loadTasks();
-    }
+    loadTasks();
   </script>
 </body>
 </html>
 """
 
+# Кнопки для Админа (со всеми функциями)
 def get_admin_keyboard():
     has_web = bool(WEBAPP_URL and WEBAPP_URL.startswith("https://"))
     buttons = [
         [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")]
     ]
     if has_web:
-        buttons.append([KeyboardButton(text="📱 Веб-редактор", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
-    buttons.append([KeyboardButton(text="⚡️ Отправить сейчас"), KeyboardButton(text="❌ Отмена")])
+        buttons.append([KeyboardButton(text="📱 Веб-панель", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
+    buttons.append([KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="⚡️ Отправить сейчас")])
+    buttons.append([KeyboardButton(text="❌ Отмена")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
+# Кнопки для Одноклассников (БЕЗ ВЕБА, ТОЛЬКО ЧТЕНИЕ)
 def get_student_keyboard():
-    has_web = bool(WEBAPP_URL and WEBAPP_URL.startswith("https://"))
     buttons = [
         [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")]
     ]
-    if has_web:
-        buttons.append([KeyboardButton(text="📖 Электронный дневник", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp?tab=diary"))])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
-class EditHW(StatesGroup):
-    waiting_for_text = State()
-    waiting_for_subject = State()
-    waiting_for_ai_prompt = State()
-
 def calculate_reminder_date(lesson_date: datetime.date) -> datetime.date:
-    if lesson_date.weekday() == 0:  # Понедельник -> пятница
+    if lesson_date.weekday() == 0:
         return lesson_date - timedelta(days=3)
     return lesson_date - timedelta(days=1)
 
@@ -1096,36 +1056,56 @@ def get_photo_list(photo_field: str | None) -> list[str]:
         pass
     return [photo_field]
 
+# --- УЧЕТ ПОЛЬЗОВАТЕЛЕЙ И ОПОВЕЩЕНИЕ АДМИНА ---
+async def track_user_and_notify(msg: Message):
+    u = msg.from_user
+    if not u:
+        return
+
+    now_str = datetime.now(TZ).strftime("%d.%m %H:%M")
+    full_name = u.full_name or "Ученик"
+    username = u.username or ""
+
+    async with aiosqlite.connect("school.db") as db:
+        await db.execute("""
+            INSERT INTO users (user_id, username, full_name, last_active)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                last_active=excluded.last_active
+        """, (u.id, username, full_name, now_str))
+        await db.commit()
+
+    # Если действие совершил НЕ админ — сразу присылаем уведомление старосте
+    if u.id != ADMIN_CHAT_ID:
+        action_text = msg.text or "Отправил файл/фото"
+        admin_notice = (
+            f"👤 <b>Активность в боте:</b>\n"
+            f"Ученик: <b>{html.escape(full_name)}</b> (@{username if username else 'нет'})\n"
+            f"ID: <code>{u.id}</code>\n"
+            f"Нажал/написал: <code>{html.escape(action_text)}</code>"
+        )
+        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✉️ Ответить ему", callback_data=f"pm_user:{u.id}")]
+        ])
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, admin_notice, reply_markup=reply_kb, parse_mode="HTML")
+        except Exception:
+            pass
+
 # --- API МАРШРУТЫ WEB APP ---
 async def web_handle(request):
     return web.Response(text=WEBAPP_HTML, content_type="text/html")
 
 async def api_get_homework(request):
     user_id = int(request.query.get("user_id", 0))
-    is_admin = (user_id == ADMIN_CHAT_ID or user_id == 0)
-
-    target_d, target_title = get_target_lesson_date()
-    target_d_str = target_d.strftime("%Y-%m-%d")
-
-    short_title = "Пн" if target_d.weekday() == 0 else "Завтра"
+    if user_id != ADMIN_CHAT_ID and user_id != 0:
+        return web.json_response({"tasks": [], "error": "Access restricted to admin"})
 
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
-        
-        # Если открыл ученик — фильтруем СТРОГО на завтра/понедельник
-        if not is_admin:
-            query = """
-                SELECT id, subject, task_text, photo_id, send_date, lesson_date 
-                FROM homework 
-                WHERE lesson_date = ? OR (lesson_date IS NULL AND send_date = ?)
-                ORDER BY id ASC
-            """
-            params = (target_d_str, calculate_reminder_date(target_d).strftime("%Y-%m-%d"))
-        else:
-            query = "SELECT id, subject, task_text, photo_id, send_date, lesson_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC"
-            params = ()
-
-        async with db.execute(query, params) as cursor:
+        async with db.execute("SELECT id, subject, task_text, photo_id, send_date, lesson_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC") as cursor:
             rows = await cursor.fetchall()
             result = []
             for r in rows:
@@ -1145,13 +1125,8 @@ async def api_get_homework(request):
                     "lesson_date": l_date.strftime("%Y-%m-%d"),
                     "date_info": f"{DAYS_MAP[l_date.weekday()].capitalize()} ({l_date.strftime('%d.%m')})"
                 })
-            return web.json_response({
-                "tasks": result,
-                "target_title": target_title,
-                "short_title": short_title
-            })
+            return web.json_response({"tasks": result})
 
-# БЕЗОПАСНЫЙ И НАДЕЖНЫЙ ЭНДПОИНТ ДНЕВНИКА
 async def api_get_diary(request):
     try:
         async with aiosqlite.connect("school.db") as db:
@@ -1389,6 +1364,15 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
+        # Таблица учета одноклассников
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                last_active TEXT
+            )
+        """)
         try:
             await db.execute("ALTER TABLE homework ADD COLUMN lesson_date TEXT")
         except Exception:
@@ -1523,7 +1507,7 @@ def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     ]
     if has_web:
         buttons.append([
-            InlineKeyboardButton(text="📱 Открыть в Web App", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
+            InlineKeyboardButton(text="📱 Открыть в Веб-панели", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
         ])
     buttons.extend([
         [
@@ -1537,18 +1521,19 @@ def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+# Приветствие: адаптировано для Админа и для Одноклассников
 @dp.message(CommandStart())
 async def start_cmd(msg: Message):
+    await track_user_and_notify(msg)
     is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
     if is_admin:
         await msg.answer(
-            "👋 <b>Добро пожаловать, староста!</b>\n\n"
+            "👋 <b>Привет, староста!</b>\n\n"
             "Управление заданиями 8-Б класса:\n"
-            "• <b>📱 Веб-редактор</b> — загрузка фото, дневник, добавление ДЗ\n"
-            "• <b>📚 Список ДЗ</b> — просмотр актуальной очереди\n"
-            "• <b>📅 Расписание</b> — уроки на неделю\n"
-            "• <b>⚡️ Отправить сейчас</b> — выгрузить задания\n\n"
-            "Одноклассники видят только задания на завтра / понедельник.",
+            "• <b>📱 Веб-панель</b> — редактор с фото и выбором дней (только у тебя)\n"
+            "• <b>👥 Пользователи</b> — список одноклассников и рассылка\n"
+            "• <b>📚 Список ДЗ</b> — просмотр очереди\n"
+            "• <b>⚡️ Отправить сейчас</b> — выгрузить задания",
             reply_markup=get_admin_keyboard(),
             parse_mode="HTML"
         )
@@ -1556,9 +1541,8 @@ async def start_cmd(msg: Message):
         target_d, target_title = get_target_lesson_date()
         await msg.answer(
             f"👋 <b>Привет! Это бот домашнего задания 8-Б класса.</b>\n\n"
-            f"• <b>📚 Список ДЗ</b> — задания {target_title} ({target_d.strftime('%d.%m')})\n"
-            f"• <b>📖 Электронный дневник</b> — расписание и история уроков по дням\n"
-            f"• <b>📅 Расписание</b> — расписание звонков и уроков класса",
+            f"• Нажми <b>«📚 Список ДЗ»</b>, чтобы посмотреть домашку {target_title} ({target_d.strftime('%d.%m')})\n"
+            f"• Нажми <b>«📅 Расписание»</b>, чтобы узнать расписание уроков",
             reply_markup=get_student_keyboard(),
             parse_mode="HTML"
         )
@@ -1566,6 +1550,7 @@ async def start_cmd(msg: Message):
 @dp.message(F.text.in_(["Отмена", "❌ Отмена"]))
 @dp.message(Command("cancel"))
 async def cancel_fsm(msg: Message, state: FSMContext):
+    await track_user_and_notify(msg)
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     current_state = await state.get_state()
@@ -1575,9 +1560,108 @@ async def cancel_fsm(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("❌ Действие отменено.", reply_markup=get_admin_keyboard())
 
+# --- АДМИН-МЕНЮ ПОЛЬЗОВАТЕЛЕЙ И РАССЫЛКИ ---
+@dp.message(F.text == "👥 Пользователи")
+@dp.message(Command("users"))
+async def users_admin_cmd(msg: Message):
+    if msg.from_user.id != ADMIN_CHAT_ID:
+        return
+
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT user_id, username, full_name, last_active FROM users ORDER BY last_active DESC LIMIT 30") as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await msg.answer("Пока никто из одноклассников не заходил в бота.", reply_markup=get_admin_keyboard())
+        return
+
+    text_lines = [f"👥 <b>Одноклассники в боте (всего: {len(rows)}):</b>\n"]
+    buttons = []
+    for idx, r in enumerate(rows, start=1):
+        uname = f"@{r['username']}" if r['username'] else "нет юзернейма"
+        text_lines.append(f"{idx}. <b>{html.escape(r['full_name'])}</b> ({uname}) — <i>{r['last_active']}</i>")
+        if r['user_id'] != ADMIN_CHAT_ID:
+            buttons.append([InlineKeyboardButton(text=f"✉️ Написать: {r['full_name'][:18]}", callback_data=f"pm_user:{r['user_id']}")])
+
+    buttons.append([InlineKeyboardButton(text="📢 Разослать сообщение всему классу", callback_data="broadcast_all")])
+    await msg.answer("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+# Личное сообщение ученику
+@dp.callback_query(F.data.startswith("pm_user:"))
+async def pm_user_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        return
+    target_uid = int(call.data.split(":")[1])
+    await state.update_data(target_uid=target_uid)
+    await state.set_state(AdminStates.waiting_for_reply)
+    await call.message.reply(
+        f"✉️ <b>Напиши текст сообщения для ученика (ID: {target_uid}):</b>\n\nДля отмены нажми «❌ Отмена».",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@dp.message(AdminStates.waiting_for_reply, F.from_user.id == ADMIN_CHAT_ID)
+async def pm_user_send(msg: Message, state: FSMContext):
+    text = msg.text or ""
+    if not text:
+        await msg.answer("Текст не может быть пустым.")
+        return
+    data = await state.get_data()
+    target_uid = data["target_uid"]
+
+    outgoing_text = f"<b>Сообщение от старосты класса:</b>\n\n<blockquote>{html.escape(text)}</blockquote>"
+    try:
+        await bot.send_message(target_uid, outgoing_text, parse_mode="HTML")
+        await msg.answer("✅ Сообщение успешно доставлено ученику!", reply_markup=get_admin_keyboard())
+    except Exception as e:
+        await msg.answer(f"❌ Не удалось отправить (возможно, ученик заблокировал бота): {e}", reply_markup=get_admin_keyboard())
+    await state.clear()
+
+# Рассылка всем
+@dp.callback_query(F.data == "broadcast_all")
+async def broadcast_start(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await call.message.reply(
+        "📢 <b>Напиши объявление для всего класса:</b>\nОно придет каждому однокласснику, который открывал бота.\n\nДля отмены нажми «❌ Отмена».",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@dp.message(AdminStates.waiting_for_broadcast, F.from_user.id == ADMIN_CHAT_ID)
+async def broadcast_finish(msg: Message, state: FSMContext):
+    text = msg.text or ""
+    if not text:
+        await msg.answer("Текст не может быть пустым.")
+        return
+
+    async with aiosqlite.connect("school.db") as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_CHAT_ID,)) as cursor:
+            users = await cursor.fetchall()
+
+    if not users:
+        await msg.answer("Некому рассылать, пока нет других учеников.", reply_markup=get_admin_keyboard())
+        await state.clear()
+        return
+
+    broadcast_text = f"<b>Объявление для 8-Б класса:</b>\n\n<blockquote>{html.escape(text)}</blockquote>"
+    sent_count = 0
+    for u in users:
+        try:
+            await bot.send_message(u[0], broadcast_text, parse_mode="HTML")
+            sent_count += 1
+        except Exception:
+            pass
+
+    await msg.answer(f"✅ Объявление разослано! Доставлено: {sent_count} из {len(users)} учеников.", reply_markup=get_admin_keyboard())
+    await state.clear()
+
 @dp.message(F.text.in_(["Расписание", "📅 Расписание"]))
 @dp.message(Command("расписание"))
 async def view_schedule_cmd(msg: Message):
+    await track_user_and_notify(msg)
     is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
     kb = get_admin_keyboard() if is_admin else get_student_keyboard()
 
@@ -1594,6 +1678,7 @@ async def view_schedule_cmd(msg: Message):
 @dp.message(F.text.in_(["Список ДЗ", "📚 Список ДЗ"]))
 @dp.message(Command("dz"))
 async def view_homework_cmd(msg: Message):
+    await track_user_and_notify(msg)
     is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
     kb = get_admin_keyboard() if is_admin else get_student_keyboard()
 
@@ -1603,7 +1688,7 @@ async def view_homework_cmd(msg: Message):
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
 
-        # Если смотрит одноклассник — строго на следующий учебный день
+        # Одноклассник видит ТОЛЬКО задания на следующий учебный день
         if not is_admin:
             query = """
                 SELECT id, subject, task_text, photo_id, send_date, lesson_date 
@@ -1613,7 +1698,7 @@ async def view_homework_cmd(msg: Message):
             """
             params = (target_d_str, calculate_reminder_date(target_d).strftime("%Y-%m-%d"))
         else:
-            # Админ видит всю активную очередь
+            # Староста видит всю очередь заданий
             query = "SELECT id, subject, task_text, photo_id, send_date, lesson_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC"
             params = ()
 
@@ -1622,7 +1707,7 @@ async def view_homework_cmd(msg: Message):
 
     if not rows:
         if not is_admin:
-            await msg.answer(f"📭 Домашних заданий {target_title} ({target_d.strftime('%d.%m')}) нет.\nОткрой «📖 Электронный дневник», чтобы посмотреть другие дни!", reply_markup=kb)
+            await msg.answer(f"📭 Домашних заданий {target_title} ({target_d.strftime('%d.%m')}) пока нет.", reply_markup=kb)
         else:
             await msg.answer("📭 В очереди нет активных заданий.", reply_markup=kb)
         return
@@ -1739,6 +1824,7 @@ async def cancel_date_change_callback(call: CallbackQuery):
     await call.message.delete()
     await call.answer("Отменено")
 
+# Официальное сообщение для группы
 async def send_hw_item(subject: str, task_text: str, photo_field: str | None, lesson_date_str: str | None = None):
     photos = get_photo_list(photo_field)
     task_display = task_text if "<blockquote>" in task_text else f"<blockquote>{html.escape(task_text)}</blockquote>"
@@ -1928,14 +2014,17 @@ async def edit_subj_finish(msg: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+# Прием заданий через чат (только Админ)
 @dp.message(StateFilter(None))
 async def handle_homework(msg: Message):
+    await track_user_and_notify(msg)
+
     if msg.from_user.id != ADMIN_CHAT_ID:
         target_d, target_title = get_target_lesson_date()
         await msg.answer(
             f"🔒 <b>Режим ученика:</b> добавлять ДЗ может только староста.\n\n"
-            f"• <b>📚 Список ДЗ</b> — посмотреть уроки {target_title} ({target_d.strftime('%d.%m')})\n"
-            f"• <b>📖 Электронный дневник</b> — расписание и история уроков в удобном вебе!",
+            f"• Нажми <b>«📚 Список ДЗ»</b>, чтобы посмотреть задания {target_title} ({target_d.strftime('%d.%m')})\n"
+            f"• Нажми <b>«📅 Расписание»</b>, чтобы посмотреть уроки недели",
             reply_markup=get_student_keyboard(),
             parse_mode="HTML"
         )
@@ -2052,6 +2141,7 @@ async def send_due_homework(force_resend: bool = False) -> int:
 @dp.message(F.text.in_(["Отправить сейчас", "⚡️ Отправить сейчас", "⚡ Отправить сейчас"]))
 @dp.message(Command("send"))
 async def manual_send_cmd(msg: Message):
+    await track_user_and_notify(msg)
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     count = await send_due_homework(force_resend=False)
