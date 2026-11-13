@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 import html
 import base64
@@ -12,14 +13,12 @@ import httpx
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, CallbackQuery, 
+    Message, CallbackQuery, BotCommand,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardRemove, MenuButtonWebApp, MenuButtonCommands,
     InputMediaPhoto, BufferedInputFile, WebAppInfo
 )
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -51,13 +50,8 @@ DAYS_MAP = {
 }
 
 ACCUSATIVE_DAYS = {
-    0: "понедельник",
-    1: "вторник",
-    2: "среду",
-    3: "четверг",
-    4: "пятницу",
-    5: "субботу",
-    6: "воскресенье"
+    0: "понедельник", 1: "вторник", 2: "среду",
+    3: "четверг", 4: "пятницу", 5: "субботу", 6: "воскресенье"
 }
 # ===============================================
 
@@ -68,403 +62,364 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 media_group_cache = {}
 
-# Состояния FSM
-class AdminStates(StatesGroup):
-    waiting_for_reply = State()
-    waiting_for_broadcast = State()
+# Хранилище для системы АНТИ-СПАМ
+banned_users_cache = set()
+last_action_time = {}
+spam_strikes = {}
+muted_until = {}
+msg_timestamps = {}
 
-class EditHW(StatesGroup):
-    waiting_for_text = State()
-    waiting_for_subject = State()
-    waiting_for_ai_prompt = State()
+def check_antispam(user_id: int, is_text_msg: bool = False) -> tuple[bool, str | None]:
+    if user_id == ADMIN_CHAT_ID:
+        return False, None
+    if user_id in banned_users_cache:
+        return True, None  # Полный игнор забаненных
 
-# Определение даты следующего учебного дня (Завтра или Понедельник)
+    now = time.time()
+    if muted_until.get(user_id, 0) > now:
+        return True, None  # Полный игнор во время мута
+
+    # Проверка скорости нажатий / сообщений
+    last_t = last_action_time.get(user_id, 0)
+    if now - last_t < 2.0:
+        spam_strikes[user_id] = spam_strikes.get(user_id, 0) + 1
+        if spam_strikes[user_id] >= 5:
+            muted_until[user_id] = now + 180  # 3 минуты мута
+            spam_strikes[user_id] = 0
+            return True, "⏳ Слишком много действий подряд. Включена защита от спама на 3 минуты."
+        return True, "Не так быстро! Подожди пару секунд."
+
+    last_action_time[user_id] = now
+    if now - last_t > 10:
+        spam_strikes[user_id] = 0
+
+    # Ограничение на спам текстовыми сообщениями в личку старосте
+    if is_text_msg:
+        history = [t for t in msg_timestamps.get(user_id, []) if now - t < 60]
+        if len(history) >= 3:
+            muted_until[user_id] = now + 300  # 5 минут мута
+            msg_timestamps[user_id] = []
+            return True, "⏳ Слишком много сообщений за минуту. Подожди 5 минут (защита от спама)."
+        history.append(now)
+        msg_timestamps[user_id] = history
+
+    return False, None
+
 def get_target_lesson_date() -> tuple[datetime.date, str]:
     now = datetime.now(TZ)
     today = now.date()
     weekday = today.weekday()
     
-    if weekday == 4:  # Пятница -> Понедельник (+3)
+    if weekday == 4:
         target = today + timedelta(days=3)
         day_text = "на понедельник"
-    elif weekday == 5:  # Суббота -> Понедельник (+2)
+    elif weekday == 5:
         target = today + timedelta(days=2)
         day_text = "на понедельник"
-    elif weekday == 6:  # Воскресенье -> Понедельник (+1)
+    elif weekday == 6:
         target = today + timedelta(days=1)
         day_text = "на понедельник"
-    else:  # Пн, Вт, Ср, Чт -> Завтра
+    else:
         target = today + timedelta(days=1)
         day_text = f"на {ACCUSATIVE_DAYS.get(target.weekday(), 'завтра')}"
         
     return target, day_text
 
-# ВЕБ-ПРИЛОЖЕНИЕ: СТРОГО ДЛЯ АДМИНА
+# ВЕБ-САЙТ С МЕССЕНДЖЕРОМ И БАН-КНОПКОЙ
 WEBAPP_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Школьный Секретарь 8-Б</title>
+  <title>Староста 8-Б | Панель управления</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root {
-      --bg: #0d1117;
-      --card-bg: #161f2c;
-      --input-bg: #0f1620;
-      --text: #ffffff;
-      --hint: #8b9bb4;
+      --bg: #090d16;
+      --card: #131b26;
+      --card-hover: #1a2535;
+      --input: #0c121c;
+      --text: #f0f6fc;
+      --muted: #8b9bb4;
       --accent: #2ea6ff;
-      --accent-glow: rgba(46, 166, 255, 0.25);
+      --accent-gradient: linear-gradient(135deg, #2ea6ff 0%, #0077ff 100%);
+      --accent-glow: rgba(46, 166, 255, 0.3);
       --danger: #ff5252;
       --success: #00e676;
       --border: rgba(255, 255, 255, 0.08);
+      --bubble-in: #1c2738;
+      --bubble-out: #1b4974;
       --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; font-family: var(--font); }
     body {
-      margin: 0; padding: 12px 14px 90px 14px;
+      margin: 0; padding: 0;
       background-color: var(--bg);
       color: var(--text);
+      display: flex; flex-direction: column; height: 100vh; overflow: hidden;
     }
-    .header-bar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 12px;
-      padding: 0 4px;
+    header {
+      background: rgba(19, 27, 38, 0.95);
+      backdrop-filter: blur(12px);
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+      flex-shrink: 0;
     }
-    .header-title { font-size: 16px; font-weight: 700; }
-    .role-badge {
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 8px;
-      font-weight: 600;
-      background: rgba(46, 166, 255, 0.18);
-      color: var(--accent);
+    .brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 16px; }
+    .brand-badge { background: var(--accent); color: #fff; font-size: 11px; padding: 2px 7px; border-radius: 6px; }
+    .header-info { font-size: 12px; color: var(--muted); }
+
+    .nav-bar {
+      display: flex; gap: 6px; padding: 10px 14px;
+      background: var(--bg); border-bottom: 1px solid var(--border);
+      overflow-x: auto; scrollbar-width: none; flex-shrink: 0;
+    }
+    .nav-bar::-webkit-scrollbar { display: none; }
+    .nav-item {
+      padding: 8px 14px; font-size: 13px; font-weight: 700;
+      border-radius: 10px; border: 1px solid var(--border);
+      background: var(--card); color: var(--muted);
+      cursor: pointer; white-space: nowrap; transition: all 0.2s;
+    }
+    .nav-item.active {
+      background: var(--accent-gradient); color: #fff;
+      border-color: transparent; box-shadow: 0 4px 14px var(--accent-glow);
     }
 
-    .nav {
-      display: flex;
-      background: rgba(22, 31, 44, 0.95);
-      backdrop-filter: blur(10px);
-      border-radius: 14px;
-      padding: 4px;
-      margin-bottom: 14px;
-      border: 1px solid var(--border);
-      position: sticky;
-      top: 6px;
-      z-index: 100;
-    }
-    .nav-btn {
-      flex: 1;
-      padding: 9px 2px;
-      font-size: 12px;
-      font-weight: 700;
-      text-align: center;
-      background: transparent;
-      color: var(--hint);
-      border: none;
-      border-radius: 10px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
-    .nav-btn.active {
-      background: var(--accent);
-      color: #fff;
-      box-shadow: 0 3px 12px var(--accent-glow);
-    }
-    .tab-content { display: none; }
-    .tab-content.active { display: block; animation: fadeIn 0.2s ease; }
+    main { flex: 1; overflow-y: auto; padding: 14px; position: relative; }
+    .tab-view { display: none; }
+    .tab-view.active { display: block; animation: fadeIn 0.2s ease; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
+    .chat-list-view { display: flex; flex-direction: column; gap: 8px; }
+    .chat-user-item {
+      background: var(--card); border: 1px solid var(--border);
+      padding: 12px 14px; border-radius: 14px; cursor: pointer;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .user-avatar {
+      width: 40px; height: 40px; border-radius: 50%;
+      background: linear-gradient(135deg, #2ea6ff, #9c27b0);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 16px; color: #fff; margin-right: 12px; flex-shrink: 0;
+    }
+    .user-meta { flex: 1; min-width: 0; }
+    .user-name { font-size: 14px; font-weight: 700; margin-bottom: 2px; }
+    .user-last-msg { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .user-time { font-size: 11px; color: var(--muted); }
+    .ban-tag { font-size: 10px; background: rgba(255, 82, 82, 0.2); color: var(--danger); padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+
+    .active-chat-box {
+      display: none; flex-direction: column; height: 100%;
+      background: var(--bg); position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 50; padding: 12px;
+    }
+    .chat-top-header {
+      display: flex; align-items: center; gap: 10px;
+      padding-bottom: 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .chat-back-btn {
+      background: var(--card); border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: 6px 12px;
+      font-weight: 700; font-size: 12px; cursor: pointer;
+    }
+    .chat-messages {
+      flex: 1; overflow-y: auto; padding: 12px 4px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .msg-bubble {
+      max-width: 82%; padding: 10px 14px; border-radius: 14px;
+      font-size: 13.5px; line-height: 1.45; word-wrap: break-word;
+    }
+    .msg-in { align-self: flex-start; background: var(--bubble-in); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+    .msg-out { align-self: flex-end; background: var(--bubble-out); color: #fff; border-bottom-right-radius: 4px; }
+    .msg-time { font-size: 10px; opacity: 0.6; text-align: right; margin-top: 4px; }
+    .chat-input-bar { display: flex; gap: 8px; padding-top: 8px; border-top: 1px solid var(--border); flex-shrink: 0; }
+    .chat-input-bar input {
+      flex: 1; background: var(--card); border: 1px solid var(--border);
+      color: var(--text); border-radius: 12px; padding: 11px 14px; font-size: 14px; outline: none;
+    }
+    .chat-send-btn {
+      background: var(--accent-gradient); color: #fff;
+      border: none; border-radius: 12px; padding: 0 18px; font-weight: 700; font-size: 14px; cursor: pointer;
+    }
+
     .card {
-      background: var(--card-bg);
-      border-radius: 16px;
-      padding: 15px;
-      margin-bottom: 14px;
-      border: 1px solid var(--border);
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+      background: var(--card); border-radius: 16px; padding: 16px; margin-bottom: 14px;
+      border: 1px solid var(--border); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
     }
-    .card-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 12px;
-      gap: 10px;
-    }
+    .card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .subj-pill {
-      background: rgba(46, 166, 255, 0.12);
-      color: var(--accent);
-      border: 1px solid rgba(46, 166, 255, 0.35);
-      padding: 7px 12px;
-      border-radius: 10px;
-      font-size: 13px;
-      font-weight: 700;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
+      background: rgba(46, 166, 255, 0.12); color: var(--accent);
+      border: 1px solid rgba(46, 166, 255, 0.35); padding: 7px 12px;
+      border-radius: 10px; font-size: 13px; font-weight: 700;
+      display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
     }
-    .subj-pill:active { transform: scale(0.96); }
-    .date-badge {
-      font-size: 12px;
-      color: var(--hint);
-      text-align: right;
-      cursor: pointer;
-      text-decoration: underline dotted;
-    }
-
-    .dates-slider {
-      display: flex;
-      gap: 6px;
-      margin-bottom: 12px;
-      overflow-x: auto;
-      scrollbar-width: none;
-      padding-bottom: 2px;
-    }
-    .dates-slider::-webkit-scrollbar { display: none; }
-    .date-chip {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border);
-      color: var(--hint);
-      padding: 6px 12px;
-      border-radius: 10px;
-      font-size: 12px;
-      font-weight: 600;
-      white-space: nowrap;
-      cursor: pointer;
-    }
-    .date-chip.active {
-      background: rgba(46, 166, 255, 0.2);
-      border-color: var(--accent);
-      color: var(--accent);
-      font-weight: 700;
-    }
-
+    .date-badge { font-size: 12px; color: var(--muted); text-align: right; cursor: pointer; text-decoration: underline dotted; }
     textarea {
-      width: 100%;
-      background: var(--input-bg);
-      color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-      font-size: 14px;
-      line-height: 1.45;
-      resize: vertical;
-      min-height: 85px;
-      outline: none;
+      width: 100%; background: var(--input); color: var(--text);
+      border: 1px solid var(--border); border-radius: 12px;
+      padding: 12px; font-size: 14px; line-height: 1.45; resize: vertical; min-height: 85px; outline: none;
     }
     textarea:focus { border-color: var(--accent); }
 
-    .ai-row {
-      display: flex;
-      gap: 6px;
-      margin: 10px 0 12px 0;
-      overflow-x: auto;
-      scrollbar-width: none;
+    .dates-slider { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; scrollbar-width: none; }
+    .dates-slider::-webkit-scrollbar { display: none; }
+    .date-chip {
+      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border);
+      color: var(--muted); padding: 6px 12px; border-radius: 10px; font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer;
     }
+    .date-chip.active { background: rgba(46, 166, 255, 0.2); border-color: var(--accent); color: var(--accent); font-weight: 700; }
+
+    .ai-row { display: flex; gap: 6px; margin: 10px 0 12px 0; overflow-x: auto; scrollbar-width: none; }
     .ai-row::-webkit-scrollbar { display: none; }
     .ai-tag {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border);
-      color: #79c0ff;
-      padding: 6px 12px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 600;
-      white-space: nowrap;
-      cursor: pointer;
+      background: rgba(46, 166, 255, 0.08); border: 1px solid rgba(46, 166, 255, 0.2);
+      color: #79c0ff; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer;
     }
 
     .action-row { display: flex; gap: 8px; }
     .btn {
-      flex: 1;
-      padding: 10px;
-      border-radius: 10px;
-      border: none;
-      font-size: 13px;
-      font-weight: 700;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      flex: 1; padding: 10px; border-radius: 10px; border: none;
+      font-size: 13px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center;
     }
-    .btn:active { transform: scale(0.97); }
-    .btn-save { background: var(--accent); color: #fff; }
+    .btn-save { background: var(--accent-gradient); color: #fff; }
     .btn-send { background: rgba(0, 230, 118, 0.14); color: var(--success); border: 1px solid rgba(0, 230, 118, 0.3); }
     .btn-del { background: rgba(255, 82, 82, 0.12); color: var(--danger); border: 1px solid rgba(255, 82, 82, 0.25); flex: 0.55; }
 
     .photo-preview-grid { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
-    .photo-thumb {
-      position: relative; width: 72px; height: 72px;
-      border-radius: 10px; overflow: hidden; border: 1px solid var(--border);
-    }
+    .photo-thumb { position: relative; width: 72px; height: 72px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
     .photo-thumb img { width: 100%; height: 100%; object-fit: cover; }
     .photo-thumb .del-btn {
-      position: absolute; top: 3px; right: 3px;
-      background: rgba(0,0,0,0.7); color: #fff; border-radius: 50%;
-      width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
-      font-size: 12px; cursor: pointer;
+      position: absolute; top: 3px; right: 3px; background: rgba(0,0,0,0.8);
+      color: #fff; border-radius: 50%; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; font-size: 12px; cursor: pointer;
     }
     .upload-btn {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px dashed var(--accent);
-      color: var(--accent);
-      padding: 10px;
-      border-radius: 12px;
-      font-size: 13px;
-      font-weight: 600;
-      text-align: center;
-      cursor: pointer;
-      margin-bottom: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
+      background: rgba(255, 255, 255, 0.04); border: 1px dashed var(--accent);
+      color: var(--accent); padding: 12px; border-radius: 12px; font-size: 13px; font-weight: 600; text-align: center; cursor: pointer; margin-bottom: 12px;
     }
 
-    /* Дневник */
-    .diary-day {
-      background: var(--card-bg);
-      border-radius: 16px;
-      padding: 16px;
-      margin-bottom: 16px;
-      border: 1px solid var(--border);
-    }
-    .diary-day-title {
-      font-size: 15px;
-      font-weight: 700;
-      color: var(--accent);
-      margin-bottom: 12px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .diary-task-item {
-      background: var(--input-bg);
-      border-radius: 12px;
-      padding: 12px;
-      margin-bottom: 10px;
-      border: 1px solid var(--border);
-    }
-    .diary-task-item:last-child { margin-bottom: 0; }
-    .diary-task-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 8px;
-    }
-    .diary-subj { font-weight: 700; font-size: 14px; }
-    .status-chip {
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-weight: 600;
-    }
+    .diary-day { background: var(--card); border-radius: 16px; padding: 16px; margin-bottom: 14px; border: 1px solid var(--border); }
+    .diary-day-title { font-size: 15px; font-weight: 700; color: var(--accent); margin-bottom: 12px; display: flex; justify-content: space-between; }
+    .diary-task-item { background: var(--input); border-radius: 12px; padding: 12px; margin-bottom: 10px; border: 1px solid var(--border); }
+    .diary-task-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .status-chip { font-size: 11px; padding: 3px 8px; border-radius: 6px; font-weight: 600; }
     .status-sent { background: rgba(0, 230, 118, 0.15); color: var(--success); }
     .status-pending { background: rgba(46, 166, 255, 0.15); color: var(--accent); }
 
-    .modal-overlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(4px);
-      z-index: 999; display: none; align-items: flex-end;
-    }
-    .modal-overlay.active { display: flex; animation: fadeIn 0.15s ease; }
-    .sheet {
-      background: #161f2c; width: 100%; border-top-left-radius: 20px; border-top-right-radius: 20px;
-      padding: 18px 16px 30px 16px; max-height: 80vh; overflow-y: auto; border-top: 1px solid var(--border);
-      animation: slideUp 0.25s cubic-bezier(0.1, 0.9, 0.2, 1);
-    }
-    @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+    .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.7); z-index: 999; display: none; align-items: flex-end; }
+    .modal-overlay.active { display: flex; }
+    .sheet { background: #131b26; width: 100%; border-top-left-radius: 20px; border-top-right-radius: 20px; padding: 18px 16px 30px 16px; max-height: 80vh; overflow-y: auto; border-top: 1px solid var(--border); }
     .sheet-title { font-size: 16px; font-weight: 700; text-align: center; margin-bottom: 16px; }
     .subj-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-    .subj-item {
-      background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border);
-      padding: 12px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; text-align: center; cursor: pointer;
-    }
+    .subj-item { background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border); padding: 12px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; text-align: center; cursor: pointer; }
     .subj-item:active { background: var(--accent); color: #fff; }
 
-    .sched-card { background: var(--card-bg); border-radius: 14px; padding: 12px 16px; margin-bottom: 10px; border: 1px solid var(--border); }
+    .sched-card { background: var(--card); border-radius: 14px; padding: 12px 16px; margin-bottom: 10px; border: 1px solid var(--border); }
     .sched-head { font-size: 15px; font-weight: 700; color: var(--accent); margin-bottom: 6px; }
-    .sched-line {
-      font-size: 13px; padding: 5px 0; display: flex; justify-content: space-between;
-      border-bottom: 1px solid rgba(255,255,255,0.03); cursor: pointer;
-    }
+    .sched-line { font-size: 13px; padding: 5px 0; display: flex; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,0.03); cursor: pointer; }
 
     .toast {
-      position: fixed; bottom: 24px; left: 50%;
-      transform: translateX(-50%) translateY(100px);
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(100px);
       background: #1f2c3d; color: #fff; padding: 10px 22px; border-radius: 30px;
-      font-size: 13px; font-weight: 600; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-      border: 1px solid var(--border); opacity: 0; transition: all 0.25s ease; z-index: 1000;
+      font-size: 13px; font-weight: 600; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); border: 1px solid var(--border); opacity: 0; transition: all 0.25s ease; z-index: 1000;
     }
     .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
-    .status-msg { text-align: center; color: var(--hint); padding: 40px 10px; font-size: 14px; }
+    .status-msg { text-align: center; color: var(--muted); padding: 40px 10px; font-size: 14px; }
   </style>
 </head>
 <body>
 
-  <div class="header-bar">
-    <div class="header-title">Панель Старосты 8-Б</div>
-    <div class="role-badge">Администратор</div>
+  <header>
+    <div class="brand">
+      <span>8-Б Секретарь</span>
+      <span class="brand-badge">PRO</span>
+    </div>
+    <div class="header-info" id="clock">15:10</div>
+  </header>
+
+  <div class="nav-bar">
+    <div class="nav-item active" onclick="switchNav('chats')">💬 Переписка</div>
+    <div class="nav-item" onclick="switchNav('tasks')">📋 Очередь ДЗ</div>
+    <div class="nav-item" onclick="switchNav('add')">➕ Добавить ДЗ</div>
+    <div class="nav-item" onclick="switchNav('diary')">📖 Дневник</div>
+    <div class="nav-item" onclick="switchNav('schedule')">📅 Расписание</div>
   </div>
 
-  <div class="nav" id="main-nav">
-    <button class="nav-btn active" id="btn-tasks" onclick="switchTab('tasks')">Очередь</button>
-    <button class="nav-btn" id="btn-diary" onclick="switchTab('diary')">📖 Дневник</button>
-    <button class="nav-btn" id="btn-add" onclick="switchTab('add')">+ Добавить</button>
-    <button class="nav-btn" id="btn-schedule" onclick="switchTab('schedule')">Расписание</button>
-  </div>
+  <main>
+    <!-- 1. ВКЛАДКА: ПЕРЕПИСКА -->
+    <div id="view-chats" class="tab-view active">
+      <div id="chats-list" class="chat-list-view">
+        <div class="status-msg">Загрузка диалогов...</div>
+      </div>
 
-  <!-- ВКЛАДКА 1: Все активные задания очереди -->
-  <div id="tab-tasks" class="tab-content active">
-    <div id="tasks-box" class="status-msg">Загрузка очереди...</div>
-  </div>
-
-  <!-- ВКЛАДКА 2: Электронный Дневник (История по дням) -->
-  <div id="tab-diary" class="tab-content">
-    <div id="diary-box" class="status-msg">Загрузка дневника...</div>
-  </div>
-
-  <!-- ВКЛАДКА 3: Добавление задания с фото и датой -->
-  <div id="tab-add" class="tab-content">
-    <div class="card">
-      <div style="margin-bottom: 12px;">
-        <label style="font-size: 12px; color: var(--hint); font-weight: 600; margin-bottom: 6px; display: block;">ПРЕДМЕТ</label>
-        <div class="subj-pill" onclick="openPicker('new')">
-          <span id="new-subj-label">Химия</span> <span style="font-size:10px;">▼</span>
+      <div id="active-chat-box" class="active-chat-box">
+        <div class="chat-top-header">
+          <button class="chat-back-btn" onclick="closeActiveChat()">← Назад</button>
+          <div style="flex:1;">
+            <div id="chat-title-name" style="font-size:14px; font-weight:700;">Ученик</div>
+            <div id="chat-title-user" style="font-size:11px; color:var(--muted);">@username</div>
+          </div>
+          <button id="chat-ban-btn" class="chat-back-btn" style="color:var(--danger);" onclick="toggleBanActiveUser()">🚫 Бан</button>
+        </div>
+        <div id="chat-messages-box" class="chat-messages"></div>
+        <div class="chat-input-bar">
+          <input type="text" id="chat-msg-input" placeholder="Написать сообщение..." onkeydown="if(event.key==='Enter') sendWebReply()">
+          <button class="chat-send-btn" onclick="sendWebReply()">Отправить</button>
         </div>
       </div>
-
-      <div style="margin-bottom: 12px;">
-        <label style="font-size: 12px; color: var(--hint); font-weight: 600; margin-bottom: 6px; display: block;">ДЕНЬ УРОКА (СДАЧИ)</label>
-        <div id="new-dates-slider" class="dates-slider"></div>
-      </div>
-
-      <input type="file" id="new-photo-input" accept="image/*" multiple style="display:none;" onchange="handleNewPhotos(event)">
-      <div class="upload-btn" onclick="document.getElementById('new-photo-input').click()">
-        📷 Прикрепить фото (камера или галерея)
-      </div>
-      <div id="new-photos-preview" class="photo-preview-grid"></div>
-
-      <div style="margin-bottom: 8px;">
-        <label style="font-size: 12px; color: var(--hint); font-weight: 600; margin-bottom: 6px; display: block;">ЧТО ЗАДАНО</label>
-        <textarea id="new-task-text" placeholder="Напиши текст задания..."></textarea>
-      </div>
-      <div class="ai-row">
-        <div class="ai-tag" onclick="aiNew('Оформи красиво и понятно')">✨ Оформить ИИ</div>
-        <div class="ai-tag" onclick="aiNew('Сделай короче')">✂️ Короче</div>
-        <div class="ai-tag" onclick="aiNew('Разбей по пунктам 1, 2, 3')">📋 Списком</div>
-      </div>
-      <button class="btn btn-save" style="width: 100%; padding: 13px;" onclick="saveNewTask()">Добавить в расписание</button>
     </div>
-  </div>
 
-  <!-- ВКЛАДКА 4: Расписание -->
-  <div id="tab-schedule" class="tab-content">
-    <div id="sched-box" class="status-msg">Загрузка расписания...</div>
-  </div>
+    <!-- 2. ОЧЕРЕДЬ ДЗ -->
+    <div id="view-tasks" class="tab-view">
+      <div id="tasks-box" class="status-msg">Загрузка очереди...</div>
+    </div>
+
+    <!-- 3. ДОБАВИТЬ ДЗ -->
+    <div id="view-add" class="tab-view">
+      <div class="card">
+        <div style="margin-bottom: 12px;">
+          <label style="font-size: 12px; color: var(--muted); font-weight: 700; margin-bottom: 6px; display: block;">ПРЕДМЕТ</label>
+          <div class="subj-pill" onclick="openPicker('new')">
+            <span id="new-subj-label">Химия</span> <span style="font-size:10px;">▼</span>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 12px;">
+          <label style="font-size: 12px; color: var(--muted); font-weight: 700; margin-bottom: 6px; display: block;">ДЕНЬ УРОКА</label>
+          <div id="new-dates-slider" class="dates-slider"></div>
+        </div>
+
+        <input type="file" id="new-photo-input" accept="image/*" multiple style="display:none;" onchange="handleNewPhotos(event)">
+        <div class="upload-btn" onclick="document.getElementById('new-photo-input').click()">
+          📷 Прикрепить фото (камера / файлы)
+        </div>
+        <div id="new-photos-preview" class="photo-preview-grid"></div>
+
+        <div style="margin-bottom: 8px;">
+          <label style="font-size: 12px; color: var(--muted); font-weight: 700; margin-bottom: 6px; display: block;">ЗАДАНИЕ</label>
+          <textarea id="new-task-text" placeholder="Напиши текст задания..."></textarea>
+        </div>
+        <div class="ai-row">
+          <div class="ai-tag" onclick="aiNew('Оформи красиво и понятно')">✨ Оформить ИИ</div>
+          <div class="ai-tag" onclick="aiNew('Сделай короче')">✂️ Короче</div>
+          <div class="ai-tag" onclick="aiNew('Разбей по пунктам')">📋 Списком</div>
+        </div>
+        <button class="btn btn-save" style="width: 100%; padding: 13px;" onclick="saveNewTask()">Добавить в очередь</button>
+      </div>
+    </div>
+
+    <!-- 4. ДНЕВНИК -->
+    <div id="view-diary" class="tab-view">
+      <div id="diary-box" class="status-msg">Загрузка дневника...</div>
+    </div>
+
+    <!-- 5. РАСПИСАНИЕ -->
+    <div id="view-schedule" class="tab-view">
+      <div id="sched-box" class="status-msg">Загрузка расписания...</div>
+    </div>
+  </main>
 
   <div id="picker-modal" class="modal-overlay" onclick="closePicker()">
     <div class="sheet" onclick="event.stopPropagation()">
@@ -482,16 +437,20 @@ WEBAPP_HTML = """<!DOCTYPE html>
     const ADMIN_USER_ID = 6243658367;
     const currentUserId = tg?.initDataUnsafe?.user?.id || 0;
 
-    // СТРОГАЯ БЛОКИРОВКА ДЛЯ ЧУЖИХ
     if (currentUserId !== ADMIN_USER_ID && currentUserId !== 0) {
       document.body.innerHTML = `
-        <div style="text-align:center; padding:60px 20px; font-family:sans-serif;">
+        <div style="text-align:center; padding:70px 20px; font-family:sans-serif;">
           <h2 style="color:#ff5252; margin-bottom:8px;">⛔️ Доступ ограничен</h2>
-          <p style="color:#8b9bb4; font-size:14px; line-height:1.5;">Веб-панель предназначена только для старосты класса.<br>Ученики смотрят домашку через кнопки в чате бота.</p>
+          <p style="color:#8b9bb4; font-size:14px; line-height:1.5;">Личный веб-кабинет доступен только старосте класса.</p>
         </div>
       `;
       throw new Error("Access Denied");
     }
+
+    setInterval(() => {
+      const d = new Date();
+      document.getElementById('clock').innerText = d.toLocaleTimeString('ru-RU', {hour: '2-digit', minute:'2-digit'});
+    }, 1000);
 
     const SUBJECTS = [
       "Химия", "Рум. яз.", "ИКТ (ИКТБН)", "Математика", "Литература", 
@@ -504,6 +463,8 @@ WEBAPP_HTML = """<!DOCTYPE html>
     let newUploadedPhotos = [];
     let selectedLessonDateNew = null;
     let selectedReminderDateNew = null;
+    let activeChatUserId = null;
+    let activeChatIsBanned = false;
 
     function showToast(text) {
       const t = document.getElementById('toast');
@@ -513,17 +474,149 @@ WEBAPP_HTML = """<!DOCTYPE html>
       if (tg?.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
     }
 
-    function switchTab(name) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
-      document.getElementById('tab-' + name).classList.add('active');
-      document.getElementById('btn-' + name)?.classList.add('active');
-      if (name === 'tasks') loadTasks();
-      if (name === 'diary') loadDiary();
-      if (name === 'add') refreshNewDates('Химия');
-      if (name === 'schedule') loadSchedule();
+    function switchNav(tabName) {
+      document.querySelectorAll('.tab-view').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      document.getElementById('view-' + tabName).classList.add('active');
+      event.target.classList.add('active');
+
+      if (tabName === 'chats') loadChats();
+      if (tabName === 'tasks') loadTasks();
+      if (tabName === 'diary') loadDiary();
+      if (tabName === 'add') refreshNewDates('Химия');
+      if (tabName === 'schedule') loadSchedule();
     }
 
+    // --- ПЕРЕПИСКА ---
+    async function loadChats() {
+      const box = document.getElementById('chats-list');
+      try {
+        const res = await fetch('/api/chats');
+        const users = await res.json();
+        if (!users || users.length === 0) {
+          box.innerHTML = '<div class="status-msg">💬 Пока никто из учеников не писал боту.<br>Диалоги появятся здесь!</div>';
+          return;
+        }
+        box.innerHTML = '';
+        users.forEach(u => {
+          const item = document.createElement('div');
+          item.className = 'chat-user-item';
+          const initial = u.full_name ? u.full_name.charAt(0).toUpperCase() : 'У';
+          const uname = u.username ? '@' + u.username : 'без юзернейма';
+          const banLabel = u.is_banned ? '<span class="ban-tag">БАН</span>' : '';
+          item.onclick = () => openActiveChat(u.user_id, u.full_name, uname, u.is_banned);
+
+          item.innerHTML = `
+            <div style="display:flex; align-items:center; flex:1; min-width:0;">
+              <div class="user-avatar">${initial}</div>
+              <div class="user-meta">
+                <div class="user-name">${u.full_name} ${banLabel}</div>
+                <div class="user-last-msg">${u.last_message || 'Открыл бота'}</div>
+              </div>
+            </div>
+            <div class="user-time">${u.last_time || ''}</div>
+          `;
+          box.appendChild(item);
+        });
+      } catch (e) {
+        box.innerHTML = '<div class="status-msg">Ошибка загрузки переписки.</div>';
+      }
+    }
+
+    async function openActiveChat(userId, name, uname, isBanned) {
+      activeChatUserId = userId;
+      activeChatIsBanned = Boolean(isBanned);
+      document.getElementById('chat-title-name').innerText = name;
+      document.getElementById('chat-title-user').innerText = uname;
+      updateBanButtonUI();
+      document.getElementById('active-chat-box').style.display = 'flex';
+      await loadMessages(userId);
+    }
+
+    function updateBanButtonUI() {
+      const btn = document.getElementById('chat-ban-btn');
+      if (activeChatIsBanned) {
+        btn.innerText = '✅ Разбан';
+        btn.style.color = 'var(--success)';
+      } else {
+        btn.innerText = '🚫 Бан';
+        btn.style.color = 'var(--danger)';
+      }
+    }
+
+    async function toggleBanActiveUser() {
+      if (!activeChatUserId) return;
+      try {
+        const res = await fetch('/api/toggle_ban', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ user_id: activeChatUserId })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          activeChatIsBanned = data.is_banned;
+          updateBanButtonUI();
+          showToast(activeChatIsBanned ? 'Ученик заблокирован!' : 'Ученик разблокирован!');
+        }
+      } catch (e) { alert('Ошибка'); }
+    }
+
+    function closeActiveChat() {
+      document.getElementById('active-chat-box').style.display = 'none';
+      activeChatUserId = null;
+      loadChats();
+    }
+
+    async function loadMessages(userId) {
+      const box = document.getElementById('chat-messages-box');
+      box.innerHTML = '<div class="status-msg">Загрузка сообщений...</div>';
+      try {
+        const res = await fetch('/api/messages?user_id=' + userId);
+        const msgs = await res.json();
+        box.innerHTML = '';
+        if (!msgs || msgs.length === 0) {
+          box.innerHTML = '<div class="status-msg">Сообщений пока нет.</div>';
+          return;
+        }
+        msgs.forEach(m => {
+          const bubble = document.createElement('div');
+          bubble.className = 'msg-bubble ' + (m.sender === 'admin' ? 'msg-out' : 'msg-in');
+          bubble.innerHTML = `
+            <div>${m.text}</div>
+            <div class="msg-time">${m.timestamp}</div>
+          `;
+          box.appendChild(bubble);
+        });
+        box.scrollTop = box.scrollHeight;
+      } catch (e) {
+        box.innerHTML = '<div class="status-msg">Ошибка загрузки.</div>';
+      }
+    }
+
+    async function sendWebReply() {
+      if (!activeChatUserId) return;
+      const input = document.getElementById('chat-msg-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      try {
+        const res = await fetch('/api/send_message', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ user_id: activeChatUserId, text })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          input.value = '';
+          await loadMessages(activeChatUserId);
+          showToast('Отправлено ученику!');
+        } else {
+          alert('Ошибка при отправке');
+        }
+      } catch (e) { alert('Ошибка соединения'); }
+    }
+
+    // --- ШТОРКА ПРЕДМЕТОВ ---
     function buildPickerGrid() {
       const box = document.getElementById('subj-grid-box');
       box.innerHTML = '';
@@ -564,13 +657,9 @@ WEBAPP_HTML = """<!DOCTYPE html>
 
     async function refreshNewDates(subj) {
       const slider = document.getElementById('new-dates-slider');
-      slider.innerHTML = '<span style="font-size:12px; color:var(--hint);">Поиск дней урока...</span>';
+      slider.innerHTML = '<span style="font-size:12px; color:var(--muted);">Поиск дней...</span>';
       const dates = await fetchLessonDates(subj);
       slider.innerHTML = '';
-      if (!dates || dates.length === 0) {
-        slider.innerHTML = '<span style="font-size:12px; color:var(--hint);">Урок не найден в расписании</span>';
-        return;
-      }
       dates.forEach((d, idx) => {
         const chip = document.createElement('div');
         chip.className = 'date-chip' + (idx === 0 ? ' active' : '');
@@ -658,7 +747,6 @@ WEBAPP_HTML = """<!DOCTYPE html>
       renderNewPhotoPreviews();
     }
 
-    // 1. ЗАГРУЗКА ВСЕЙ ОЧЕРЕДИ ЗАДАНИЙ ДЛЯ СТАРОСТЫ
     async function loadTasks() {
       const box = document.getElementById('tasks-box');
       try {
@@ -667,10 +755,10 @@ WEBAPP_HTML = """<!DOCTYPE html>
         const tasks = data.tasks || [];
 
         if (!tasks || tasks.length === 0) {
-          box.innerHTML = '<div class="status-msg">📭 В очереди нет заданий.<br>Нажми «+ Добавить» или посмотри «Дневник»!</div>';
+          box.innerHTML = '<div class="status-msg">📭 В очереди нет заданий.<br>Нажми «+ Добавить ДЗ» чтобы создать!</div>';
           return;
         }
-        box.innerHTML = `<div style="font-size:13px; font-weight:700; color:var(--hint); margin-bottom:12px;">Всего в очереди: ${tasks.length} предм.</div>`;
+        box.innerHTML = `<div style="font-size:13px; font-weight:700; color:var(--muted); margin-bottom:12px;">Активных заданий: ${tasks.length}</div>`;
         
         for (const t of tasks) {
           const card = document.createElement('div');
@@ -705,59 +793,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
           box.appendChild(card);
         }
       } catch (e) {
-        box.innerHTML = '<div class="status-msg">Ошибка загрузки. Проверь соединение.</div>';
-      }
-    }
-
-    // 2. ЭЛЕКТРОННЫЙ ДНЕВНИК ПО ДНЯМ
-    async function loadDiary() {
-      const box = document.getElementById('diary-box');
-      box.innerHTML = '<div class="status-msg">Загрузка электронного дневника...</div>';
-      try {
-        const res = await fetch('/api/diary');
-        const diaryDays = await res.json();
-        if (!diaryDays || diaryDays.length === 0) {
-          box.innerHTML = '<div class="status-msg">📖 В дневнике пока нет записей.</div>';
-          return;
-        }
-        box.innerHTML = '';
-        diaryDays.forEach(day => {
-          const dayCard = document.createElement('div');
-          dayCard.className = 'diary-day';
-
-          let tasksHtml = '';
-          day.tasks.forEach(task => {
-            const statusHtml = task.is_sent 
-              ? '<span class="status-chip status-sent">Отправлено</span>'
-              : '<span class="status-chip status-pending">В очереди</span>';
-
-            let cleanTask = task.task_text.replace(/<[^>]+>/g, '').trim();
-
-            tasksHtml += `
-              <div class="diary-task-item">
-                <div class="diary-task-top">
-                  <div class="diary-subj">${task.subject}</div>
-                  <div>${statusHtml}</div>
-                </div>
-                <div class="diary-text">${cleanTask}</div>
-                <div style="margin-top: 8px; display: flex; justify-content: flex-end;">
-                  <button class="btn btn-send" style="padding: 6px 12px; font-size: 11px; flex: initial;" onclick="sendTaskNow(${task.id})">Выгрузить в чат</button>
-                </div>
-              </div>
-            `;
-          });
-
-          dayCard.innerHTML = `
-            <div class="diary-day-title">
-              <span>📅 ${day.date_display}</span>
-              <span style="font-size: 12px; color: var(--hint);">${day.tasks.length} предм.</span>
-            </div>
-            ${tasksHtml}
-          `;
-          box.appendChild(dayCard);
-        });
-      } catch (e) {
-        box.innerHTML = '<div class="status-msg">Ошибка загрузки дневника.</div>';
+        box.innerHTML = '<div class="status-msg">Ошибка загрузки очереди.</div>';
       }
     }
 
@@ -875,8 +911,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
-            subject,
-            text,
+            subject, text,
             photos: newUploadedPhotos,
             lesson_date: selectedLessonDateNew,
             reminder_date: selectedReminderDateNew,
@@ -889,9 +924,57 @@ WEBAPP_HTML = """<!DOCTYPE html>
           newUploadedPhotos = [];
           renderNewPhotoPreviews();
           showToast('Задание добавлено!');
-          setTimeout(() => { document.querySelectorAll('.nav-btn')[0].click(); }, 350);
+          setTimeout(() => { document.querySelectorAll('.nav-item')[1].click(); }, 350);
         } else alert('Ошибка при добавлении');
       } catch (e) { alert('Ошибка сети'); }
+    }
+
+    async function loadDiary() {
+      const box = document.getElementById('diary-box');
+      box.innerHTML = '<div class="status-msg">Загрузка дневника...</div>';
+      try {
+        const res = await fetch('/api/diary');
+        const diaryDays = await res.json();
+        if (!diaryDays || diaryDays.length === 0) {
+          box.innerHTML = '<div class="status-msg">📖 В дневнике пока нет записей.</div>';
+          return;
+        }
+        box.innerHTML = '';
+        diaryDays.forEach(day => {
+          const dayCard = document.createElement('div');
+          dayCard.className = 'diary-day';
+          let tasksHtml = '';
+          day.tasks.forEach(task => {
+            const statusHtml = task.is_sent 
+              ? '<span class="status-chip status-sent">Отправлено</span>'
+              : '<span class="status-chip status-pending">В очереди</span>';
+
+            let cleanTask = task.task_text.replace(/<[^>]+>/g, '').trim();
+            tasksHtml += `
+              <div class="diary-task-item">
+                <div class="diary-task-top">
+                  <div style="font-weight:700; font-size:14px;">${task.subject}</div>
+                  <div>${statusHtml}</div>
+                </div>
+                <div style="font-size:13px; line-height:1.45; white-space:pre-wrap;">${cleanTask}</div>
+                <div style="margin-top:8px; display:flex; justify-content:flex-end;">
+                  <button class="btn btn-send" style="padding:6px 12px; font-size:11px; flex:initial;" onclick="sendTaskNow(${task.id})">Выгрузить в чат</button>
+                </div>
+              </div>
+            `;
+          });
+          dayCard.innerHTML = `
+            <div class="diary-day-title">
+              <span>📅 ${day.date_display}</span>
+              <span style="font-size:12px; color:var(--muted);">${day.tasks.length} предм.</span>
+            </div>
+            ${tasksHtml}
+          `;
+          box.appendChild(dayCard);
+        });
+      } catch (e) {
+        box.innerHTML = '<div class="status-msg">Ошибка загрузки дневника.</div>';
+      }
     }
 
     async function loadSchedule() {
@@ -917,35 +1000,38 @@ WEBAPP_HTML = """<!DOCTYPE html>
     }
 
     function addFromSchedule(subj) {
-      document.querySelectorAll('.nav-btn')[2].click();
+      document.querySelectorAll('.nav-item')[2].click();
       document.getElementById('new-subj-label').innerText = subj;
       refreshNewDates(subj);
     }
 
-    loadTasks();
+    loadChats();
   </script>
 </body>
 </html>
 """
 
-# Кнопки для Админа (со всеми функциями)
-def get_admin_keyboard():
+# Кнопки ГЛАВНОГО ИНЛАЙН-МЕНЮ (чистый экран без нижней клавиатуры)
+def get_admin_inline_menu() -> InlineKeyboardMarkup:
     has_web = bool(WEBAPP_URL and WEBAPP_URL.startswith("https://"))
-    buttons = [
-        [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")]
-    ]
+    buttons = []
     if has_web:
-        buttons.append([KeyboardButton(text="📱 Веб-панель", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
-    buttons.append([KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="⚡️ Отправить сейчас")])
-    buttons.append([KeyboardButton(text="❌ Отмена")])
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
+        buttons.append([InlineKeyboardButton(text="🌐 Открыть Сайт (Переписка, Фото, ИИ)", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
+    buttons.append([
+        InlineKeyboardButton(text="📋 Очередь ДЗ", callback_data="adm_dz"),
+        InlineKeyboardButton(text="📅 Расписание", callback_data="adm_sched")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="⚡️ Отправить ДЗ сейчас", callback_data="adm_send")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Кнопки для Одноклассников (БЕЗ ВЕБА, ТОЛЬКО ЧТЕНИЕ)
-def get_student_keyboard():
-    buttons = [
-        [KeyboardButton(text="📚 Список ДЗ"), KeyboardButton(text="📅 Расписание")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
+def get_student_inline_menu() -> InlineKeyboardMarkup:
+    _, target_title = get_target_lesson_date()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📚 ДЗ {target_title}", callback_data="stud_dz")],
+        [InlineKeyboardButton(text="📅 Расписание уроков", callback_data="stud_sched")]
+    ])
 
 def calculate_reminder_date(lesson_date: datetime.date) -> datetime.date:
     if lesson_date.weekday() == 0:
@@ -1056,16 +1142,8 @@ def get_photo_list(photo_field: str | None) -> list[str]:
         pass
     return [photo_field]
 
-# --- УЧЕТ ПОЛЬЗОВАТЕЛЕЙ И ОПОВЕЩЕНИЕ АДМИНА ---
-async def track_user_and_notify(msg: Message):
-    u = msg.from_user
-    if not u:
-        return
-
+async def log_user_message(user_id: int, username: str, full_name: str, text: str, sender: str = "student"):
     now_str = datetime.now(TZ).strftime("%d.%m %H:%M")
-    full_name = u.full_name or "Ученик"
-    username = u.username or ""
-
     async with aiosqlite.connect("school.db") as db:
         await db.execute("""
             INSERT INTO users (user_id, username, full_name, last_active)
@@ -1074,34 +1152,87 @@ async def track_user_and_notify(msg: Message):
                 username=excluded.username,
                 full_name=excluded.full_name,
                 last_active=excluded.last_active
-        """, (u.id, username, full_name, now_str))
-        await db.commit()
+        """, (user_id, username or "", full_name or "Ученик", now_str))
 
-    # Если действие совершил НЕ админ — сразу присылаем уведомление старосте
-    if u.id != ADMIN_CHAT_ID:
-        action_text = msg.text or "Отправил файл/фото"
-        admin_notice = (
-            f"👤 <b>Активность в боте:</b>\n"
-            f"Ученик: <b>{html.escape(full_name)}</b> (@{username if username else 'нет'})\n"
-            f"ID: <code>{u.id}</code>\n"
-            f"Нажал/написал: <code>{html.escape(action_text)}</code>"
-        )
-        reply_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✉️ Ответить ему", callback_data=f"pm_user:{u.id}")]
-        ])
-        try:
-            await bot.send_message(ADMIN_CHAT_ID, admin_notice, reply_markup=reply_kb, parse_mode="HTML")
-        except Exception:
-            pass
+        await db.execute("""
+            INSERT INTO messages (user_id, sender, text, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, sender, text, now_str))
+        await db.commit()
 
 # --- API МАРШРУТЫ WEB APP ---
 async def web_handle(request):
     return web.Response(text=WEBAPP_HTML, content_type="text/html")
 
+async def api_get_chats(request):
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT u.user_id, u.username, u.full_name, u.last_active as last_time, u.is_banned,
+                   (SELECT text FROM messages WHERE user_id = u.user_id ORDER BY id DESC LIMIT 1) as last_message
+            FROM users u
+            WHERE u.user_id != ?
+            ORDER BY u.id DESC
+        """, (ADMIN_CHAT_ID,)) as cursor:
+            rows = await cursor.fetchall()
+            return web.json_response([dict(r) for r in rows])
+
+async def api_toggle_ban(request):
+    try:
+        data = await request.json()
+        target_uid = int(data.get("user_id"))
+        async with aiosqlite.connect("school.db") as db:
+            async with db.execute("SELECT is_banned FROM users WHERE user_id = ?", (target_uid,)) as cursor:
+                row = await cursor.fetchone()
+                new_status = 0 if (row and row[0] == 1) else 1
+            await db.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (new_status, target_uid))
+            await db.commit()
+        
+        if new_status == 1:
+            banned_users_cache.add(target_uid)
+        else:
+            banned_users_cache.discard(target_uid)
+
+        await sync_backup()
+        return web.json_response({"ok": True, "is_banned": bool(new_status)})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
+async def api_get_messages(request):
+    user_id = int(request.query.get("user_id", 0))
+    async with aiosqlite.connect("school.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, user_id, sender, text, timestamp FROM messages WHERE user_id = ? ORDER BY id ASC", (user_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return web.json_response([dict(r) for r in rows])
+
+async def api_send_message(request):
+    try:
+        data = await request.json()
+        target_uid = int(data.get("user_id"))
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return web.json_response({"ok": False, "error": "Empty text"})
+
+        now_str = datetime.now(TZ).strftime("%d.%m %H:%M")
+        outgoing = f"<b>Сообщение от старосты:</b>\n\n<blockquote>{html.escape(text)}</blockquote>"
+        await bot.send_message(target_uid, outgoing, parse_mode="HTML")
+
+        async with aiosqlite.connect("school.db") as db:
+            await db.execute("""
+                INSERT INTO messages (user_id, sender, text, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (target_uid, "admin", text, now_str))
+            await db.commit()
+
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)})
+
 async def api_get_homework(request):
     user_id = int(request.query.get("user_id", 0))
     if user_id != ADMIN_CHAT_ID and user_id != 0:
-        return web.json_response({"tasks": [], "error": "Access restricted to admin"})
+        return web.json_response({"tasks": [], "error": "Access restricted"})
 
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
@@ -1171,8 +1302,7 @@ async def api_get_diary(request):
 
                 sorted_days = sorted(days_dict.values(), key=lambda x: x["date"], reverse=True)
                 return web.json_response(sorted_days)
-    except Exception as e:
-        logging.error(f"Ошибка api_get_diary: {e}")
+    except Exception:
         return web.json_response([])
 
 async def api_get_lesson_dates(request):
@@ -1183,10 +1313,6 @@ async def api_get_lesson_dates(request):
 async def api_save_homework(request):
     try:
         data = await request.json()
-        user_id = int(data.get("user_id", 0))
-        if user_id != ADMIN_CHAT_ID and user_id != 0:
-            return web.json_response({"ok": False, "error": "Forbidden"})
-
         hw_id = int(data.get("id"))
         new_text = str(data.get("text", "")).strip()
         new_subj = str(data.get("subject", "")).strip()
@@ -1227,10 +1353,6 @@ async def api_save_homework(request):
 async def api_add_homework(request):
     try:
         data = await request.json()
-        user_id = int(data.get("user_id", 0))
-        if user_id != ADMIN_CHAT_ID and user_id != 0:
-            return web.json_response({"ok": False, "error": "Forbidden"})
-
         subj = str(data.get("subject", "Химия")).strip()
         text = str(data.get("text", "")).strip()
         photos_b64 = data.get("photos", [])
@@ -1285,10 +1407,6 @@ async def api_add_homework(request):
 async def api_delete_homework(request):
     try:
         data = await request.json()
-        user_id = int(data.get("user_id", 0))
-        if user_id != ADMIN_CHAT_ID and user_id != 0:
-            return web.json_response({"ok": False, "error": "Forbidden"})
-
         hw_id = int(data.get("id"))
         async with aiosqlite.connect("school.db") as db:
             await db.execute("DELETE FROM homework WHERE id = ?", (hw_id,))
@@ -1312,10 +1430,6 @@ async def api_ai_improve(request):
 async def api_send_item_now(request):
     try:
         data = await request.json()
-        user_id = int(data.get("user_id", 0))
-        if user_id != ADMIN_CHAT_ID and user_id != 0:
-            return web.json_response({"ok": False, "error": "Forbidden"})
-
         hw_id = int(data.get("id"))
         async with aiosqlite.connect("school.db") as db:
             db.row_factory = aiosqlite.Row
@@ -1333,9 +1447,13 @@ async def api_get_schedule(request):
     return web.json_response(SCHEDULE)
 
 async def start_web_server():
-    app = web.Application(client_max_size=25 * 1024 * 1024)
+    app = web.Application(client_max_size=30 * 1024 * 1024)
     app.router.add_get("/", web_handle)
     app.router.add_get("/webapp", web_handle)
+    app.router.add_get("/api/chats", api_get_chats)
+    app.router.add_post("/api/toggle_ban", api_toggle_ban)
+    app.router.add_get("/api/messages", api_get_messages)
+    app.router.add_post("/api/send_message", api_send_message)
     app.router.add_get("/api/homework", api_get_homework)
     app.router.add_get("/api/diary", api_get_diary)
     app.router.add_get("/api/lesson_dates", api_get_lesson_dates)
@@ -1364,29 +1482,49 @@ async def init_db():
                 is_sent INTEGER DEFAULT 0
             )
         """)
-        # Таблица учета одноклассников
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
                 username TEXT,
                 full_name TEXT,
-                last_active TEXT
+                last_active TEXT,
+                is_banned INTEGER DEFAULT 0
             )
         """)
-        try:
-            await db.execute("ALTER TABLE homework ADD COLUMN lesson_date TEXT")
-        except Exception:
-            pass
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                sender TEXT,
+                text TEXT,
+                timestamp TEXT
+            )
+        """)
+        for col in ["ALTER TABLE homework ADD COLUMN lesson_date TEXT", "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"]:
+            try:
+                await db.execute(col)
+            except Exception:
+                pass
+        
+        async with db.execute("SELECT user_id FROM users WHERE is_banned = 1") as cursor:
+            rows = await cursor.fetchall()
+            for r in rows:
+                banned_users_cache.add(r[0])
+
         await db.commit()
 
 async def sync_backup():
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT id, subject, task_text, photo_id, send_date, lesson_date, is_sent FROM homework") as cursor:
-            rows = await cursor.fetchall()
-            data = [dict(row) for row in rows]
+            hw_rows = [dict(r) for r in await cursor.fetchall()]
 
-    backup_text = f"📦 BACKUP_DATA:\n{json.dumps(data, ensure_ascii=False)}"
+    backup_payload = {
+        "homework": hw_rows,
+        "banned": list(banned_users_cache)
+    }
+    backup_text = f"📦 BACKUP_DATA:\n{json.dumps(backup_payload, ensure_ascii=False)}"
     try:
         chat = await bot.get_chat(ADMIN_CHAT_ID)
         pinned = chat.pinned_message
@@ -1404,23 +1542,29 @@ async def restore_from_backup():
         pinned = chat.pinned_message
         if pinned and "BACKUP_DATA" in (pinned.text or ""):
             json_str = pinned.text.split("BACKUP_DATA:\n", 1)[1]
-            data = json.loads(json_str)
+            loaded = json.loads(json_str)
+            if isinstance(loaded, list):
+                hw_items = loaded
+                banned_list = []
+            else:
+                hw_items = loaded.get("homework", [])
+                banned_list = loaded.get("banned", [])
+
+            for b_id in banned_list:
+                banned_users_cache.add(b_id)
+
             async with aiosqlite.connect("school.db") as db:
-                for item in data:
+                for item in hw_items:
                     clean_text = item["task_text"].replace("📸 ", "").replace(" 👆", "")
                     les_d = item.get("lesson_date")
                     is_s = item.get("is_sent", 0)
-                    async with db.execute(
-                        "SELECT id FROM homework WHERE id = ?",
-                        (item.get("id"),)
-                    ) as cursor:
+                    async with db.execute("SELECT id FROM homework WHERE id = ?", (item.get("id"),)) as cursor:
                         if not await cursor.fetchone():
                             await db.execute(
                                 "INSERT INTO homework (id, subject, task_text, photo_id, send_date, lesson_date, is_sent) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                 (item.get("id"), item["subject"].capitalize(), clean_text, item["photo_id"], item["send_date"], les_d, is_s)
                             )
                 await db.commit()
-            print("База восстановлена из резервной копии.")
     except Exception as e:
         logging.error(f"Ошибка восстановления: {e}")
 
@@ -1475,195 +1619,102 @@ async def improve_with_ai(subject: str, raw_task: str, user_instruction: str = "
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3
-                }
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
             )
             if resp.status_code == 200:
-                result = resp.json()
-                return result["choices"][0]["message"]["content"].strip()
-            else:
-                logging.error(f"Groq API Error {resp.status_code}: {resp.text}")
+                return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.error(f"Ошибка вызова ИИ: {e}")
+        logging.error(f"Ошибка ИИ: {e}")
 
     return clean_task
 
+# Компактные инлайн-кнопки под карточкой ДЗ (все редактирование перенесено на сайт)
 def make_hw_kb(hw_id: int) -> InlineKeyboardMarkup:
     has_web = bool(WEBAPP_URL and WEBAPP_URL.startswith("https://"))
     buttons = [
         [
-            InlineKeyboardButton(text="📤 Отправить в чат сейчас", callback_data=f"send_one:{hw_id}")
-        ],
-        [
-            InlineKeyboardButton(text="📅 Сменить день урока", callback_data=f"change_date_menu:{hw_id}")
+            InlineKeyboardButton(text="📤 В чат", callback_data=f"send_one:{hw_id}"),
+            InlineKeyboardButton(text="📅 Сменить день", callback_data=f"change_date_menu:{hw_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_hw:{hw_id}")
         ]
     ]
     if has_web:
-        buttons.append([
-            InlineKeyboardButton(text="📱 Открыть в Веб-панели", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
-        ])
-    buttons.extend([
-        [
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_hw:{hw_id}"),
-            InlineKeyboardButton(text="✏️ Свой текст", callback_data=f"edit_text:{hw_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🤖 Переписать через ИИ", callback_data=f"ai_edit:{hw_id}"),
-            InlineKeyboardButton(text="🔄 Сменить предмет", callback_data=f"edit_subj:{hw_id}")
-        ]
-    ])
+        buttons.append([InlineKeyboardButton(text="🌐 Редактировать на сайте", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Приветствие: адаптировано для Админа и для Одноклассников
+# ================= ИНЛАЙН-МЕНЮ (ВМЕСТО ОГРОМНОЙ КЛАВИАТУРЫ) =================
 @dp.message(CommandStart())
+@dp.message(Command("menu"))
 async def start_cmd(msg: Message):
-    await track_user_and_notify(msg)
+    is_spam, warn = check_antispam(msg.from_user.id)
+    if is_spam:
+        if warn: await msg.answer(warn)
+        return
+
     is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
+    await log_user_message(
+        msg.from_user.id, msg.from_user.username or "", msg.from_user.full_name or "Ученик",
+        "/start", sender="admin" if is_admin else "student"
+    )
+
+    # Убираем старую громоздкую нижнюю клавиатуру
+    rm_msg = await msg.answer("Загрузка меню...", reply_markup=ReplyKeyboardRemove())
+    try:
+        await rm_msg.delete()
+    except Exception:
+        pass
+
     if is_admin:
         await msg.answer(
-            "👋 <b>Привет, староста!</b>\n\n"
-            "Управление заданиями 8-Б класса:\n"
-            "• <b>📱 Веб-панель</b> — редактор с фото и выбором дней (только у тебя)\n"
-            "• <b>👥 Пользователи</b> — список одноклассников и рассылка\n"
-            "• <b>📚 Список ДЗ</b> — просмотр очереди\n"
-            "• <b>⚡️ Отправить сейчас</b> — выгрузить задания",
-            reply_markup=get_admin_keyboard(),
+            "⚙️ <b>Панель управления старосты 8-Б</b>\n\nВыбери действие (или открой Сайт кнопкой в левом нижнем углу):",
+            reply_markup=get_admin_inline_menu(),
             parse_mode="HTML"
         )
     else:
         target_d, target_title = get_target_lesson_date()
         await msg.answer(
-            f"👋 <b>Привет! Это бот домашнего задания 8-Б класса.</b>\n\n"
-            f"• Нажми <b>«📚 Список ДЗ»</b>, чтобы посмотреть домашку {target_title} ({target_d.strftime('%d.%m')})\n"
-            f"• Нажми <b>«📅 Расписание»</b>, чтобы узнать расписание уроков",
-            reply_markup=get_student_keyboard(),
+            f"👋 <b>Бот домашнего задания 8-Б класса</b>\n\nНажми на кнопку ниже:",
+            reply_markup=get_student_inline_menu(),
             parse_mode="HTML"
         )
 
-@dp.message(F.text.in_(["Отмена", "❌ Отмена"]))
-@dp.message(Command("cancel"))
-async def cancel_fsm(msg: Message, state: FSMContext):
-    await track_user_and_notify(msg)
-    if msg.from_user.id != ADMIN_CHAT_ID:
-        return
-    current_state = await state.get_state()
-    if current_state is None:
-        await msg.answer("👌 Нет активных действий для отмены.", reply_markup=get_admin_keyboard())
-        return
-    await state.clear()
-    await msg.answer("❌ Действие отменено.", reply_markup=get_admin_keyboard())
-
-# --- АДМИН-МЕНЮ ПОЛЬЗОВАТЕЛЕЙ И РАССЫЛКИ ---
-@dp.message(F.text == "👥 Пользователи")
-@dp.message(Command("users"))
-async def users_admin_cmd(msg: Message):
-    if msg.from_user.id != ADMIN_CHAT_ID:
+@dp.callback_query(F.data == "back_to_menu")
+async def back_to_menu_cb(call: CallbackQuery):
+    is_spam, warn = check_antispam(call.from_user.id)
+    if is_spam:
+        await call.answer(warn or "Подождите...", show_alert=False)
         return
 
-    async with aiosqlite.connect("school.db") as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT user_id, username, full_name, last_active FROM users ORDER BY last_active DESC LIMIT 30") as cursor:
-            rows = await cursor.fetchall()
-
-    if not rows:
-        await msg.answer("Пока никто из одноклассников не заходил в бота.", reply_markup=get_admin_keyboard())
-        return
-
-    text_lines = [f"👥 <b>Одноклассники в боте (всего: {len(rows)}):</b>\n"]
-    buttons = []
-    for idx, r in enumerate(rows, start=1):
-        uname = f"@{r['username']}" if r['username'] else "нет юзернейма"
-        text_lines.append(f"{idx}. <b>{html.escape(r['full_name'])}</b> ({uname}) — <i>{r['last_active']}</i>")
-        if r['user_id'] != ADMIN_CHAT_ID:
-            buttons.append([InlineKeyboardButton(text=f"✉️ Написать: {r['full_name'][:18]}", callback_data=f"pm_user:{r['user_id']}")])
-
-    buttons.append([InlineKeyboardButton(text="📢 Разослать сообщение всему классу", callback_data="broadcast_all")])
-    await msg.answer("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-
-# Личное сообщение ученику
-@dp.callback_query(F.data.startswith("pm_user:"))
-async def pm_user_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return
-    target_uid = int(call.data.split(":")[1])
-    await state.update_data(target_uid=target_uid)
-    await state.set_state(AdminStates.waiting_for_reply)
-    await call.message.reply(
-        f"✉️ <b>Напиши текст сообщения для ученика (ID: {target_uid}):</b>\n\nДля отмены нажми «❌ Отмена».",
-        parse_mode="HTML"
-    )
+    is_admin = (call.from_user.id == ADMIN_CHAT_ID)
+    if is_admin:
+        await call.message.edit_text(
+            "⚙️ <b>Панель управления старосты 8-Б</b>\n\nВыбери действие:",
+            reply_markup=get_admin_inline_menu(),
+            parse_mode="HTML"
+        )
+    else:
+        await call.message.edit_text(
+            "👋 <b>Бот домашнего задания 8-Б класса</b>\n\nВыбери нужный раздел:",
+            reply_markup=get_student_inline_menu(),
+            parse_mode="HTML"
+        )
     await call.answer()
 
-@dp.message(AdminStates.waiting_for_reply, F.from_user.id == ADMIN_CHAT_ID)
-async def pm_user_send(msg: Message, state: FSMContext):
-    text = msg.text or ""
-    if not text:
-        await msg.answer("Текст не может быть пустым.")
-        return
-    data = await state.get_data()
-    target_uid = data["target_uid"]
-
-    outgoing_text = f"<b>Сообщение от старосты класса:</b>\n\n<blockquote>{html.escape(text)}</blockquote>"
-    try:
-        await bot.send_message(target_uid, outgoing_text, parse_mode="HTML")
-        await msg.answer("✅ Сообщение успешно доставлено ученику!", reply_markup=get_admin_keyboard())
-    except Exception as e:
-        await msg.answer(f"❌ Не удалось отправить (возможно, ученик заблокировал бота): {e}", reply_markup=get_admin_keyboard())
-    await state.clear()
-
-# Рассылка всем
-@dp.callback_query(F.data == "broadcast_all")
-async def broadcast_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return
-    await state.set_state(AdminStates.waiting_for_broadcast)
-    await call.message.reply(
-        "📢 <b>Напиши объявление для всего класса:</b>\nОно придет каждому однокласснику, который открывал бота.\n\nДля отмены нажми «❌ Отмена».",
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-@dp.message(AdminStates.waiting_for_broadcast, F.from_user.id == ADMIN_CHAT_ID)
-async def broadcast_finish(msg: Message, state: FSMContext):
-    text = msg.text or ""
-    if not text:
-        await msg.answer("Текст не может быть пустым.")
+# Просмотр расписания через инлайн (плавно редактирует текущее сообщение)
+@dp.callback_query(F.data.in_(["stud_sched", "adm_sched"]))
+@dp.message(Command("schedule"))
+async def view_schedule_handler(event: Message | CallbackQuery):
+    user_id = event.from_user.id
+    is_spam, warn = check_antispam(user_id)
+    if is_spam:
+        if isinstance(event, CallbackQuery):
+            await event.answer(warn or "Подождите...")
+        elif warn:
+            await event.answer(warn)
         return
 
-    async with aiosqlite.connect("school.db") as db:
-        async with db.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_CHAT_ID,)) as cursor:
-            users = await cursor.fetchall()
-
-    if not users:
-        await msg.answer("Некому рассылать, пока нет других учеников.", reply_markup=get_admin_keyboard())
-        await state.clear()
-        return
-
-    broadcast_text = f"<b>Объявление для 8-Б класса:</b>\n\n<blockquote>{html.escape(text)}</blockquote>"
-    sent_count = 0
-    for u in users:
-        try:
-            await bot.send_message(u[0], broadcast_text, parse_mode="HTML")
-            sent_count += 1
-        except Exception:
-            pass
-
-    await msg.answer(f"✅ Объявление разослано! Доставлено: {sent_count} из {len(users)} учеников.", reply_markup=get_admin_keyboard())
-    await state.clear()
-
-@dp.message(F.text.in_(["Расписание", "📅 Расписание"]))
-@dp.message(Command("расписание"))
-async def view_schedule_cmd(msg: Message):
-    await track_user_and_notify(msg)
-    is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
-    kb = get_admin_keyboard() if is_admin else get_student_keyboard()
+    await log_user_message(user_id, event.from_user.username or "", event.from_user.full_name or "Ученик", "Расписание", sender="admin" if user_id == ADMIN_CHAT_ID else "student")
 
     lines = ["📅 <b>Расписание 8-Б класса:</b>\n"]
     for day_idx in range(5):
@@ -1672,159 +1723,136 @@ async def view_schedule_cmd(msg: Message):
         for num, subj in enumerate(SCHEDULE[day_idx], start=1):
             lines.append(f"  {num}. {html.escape(subj.capitalize())}")
         lines.append("")
-    await msg.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    text = "\n".join(lines)
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")]])
 
-# СПИСОК ДЗ: ОДНОКЛАССНИКИ ВИДЯТ ТОЛЬКО НА ЗАВТРА (ИЛИ ПОНЕДЕЛЬНИК)
-@dp.message(F.text.in_(["Список ДЗ", "📚 Список ДЗ"]))
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=back_kb, parse_mode="HTML")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=back_kb, parse_mode="HTML")
+
+# Просмотр ДЗ через инлайн или команду /dz
+@dp.callback_query(F.data.in_(["stud_dz", "adm_dz"]))
 @dp.message(Command("dz"))
-async def view_homework_cmd(msg: Message):
-    await track_user_and_notify(msg)
-    is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
-    kb = get_admin_keyboard() if is_admin else get_student_keyboard()
+async def view_homework_handler(event: Message | CallbackQuery):
+    user_id = event.from_user.id
+    is_spam, warn = check_antispam(user_id)
+    if is_spam:
+        if isinstance(event, CallbackQuery):
+            await event.answer(warn or "Подождите...")
+        elif warn:
+            await event.answer(warn)
+        return
+
+    is_admin = (user_id == ADMIN_CHAT_ID)
+    await log_user_message(user_id, event.from_user.username or "", event.from_user.full_name or "Ученик", "Список ДЗ", sender="admin" if is_admin else "student")
 
     target_d, target_title = get_target_lesson_date()
     target_d_str = target_d.strftime("%Y-%m-%d")
 
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
-
-        # Одноклассник видит ТОЛЬКО задания на следующий учебный день
         if not is_admin:
-            query = """
-                SELECT id, subject, task_text, photo_id, send_date, lesson_date 
-                FROM homework 
-                WHERE lesson_date = ? OR (lesson_date IS NULL AND send_date = ?)
-                ORDER BY id ASC
-            """
+            query = "SELECT id, subject, task_text, photo_id, send_date, lesson_date FROM homework WHERE lesson_date = ? OR (lesson_date IS NULL AND send_date = ?) ORDER BY id ASC"
             params = (target_d_str, calculate_reminder_date(target_d).strftime("%Y-%m-%d"))
         else:
-            # Староста видит всю очередь заданий
             query = "SELECT id, subject, task_text, photo_id, send_date, lesson_date FROM homework WHERE is_sent = 0 ORDER BY send_date ASC"
             params = ()
 
         async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
 
+    msg_target = event.message if isinstance(event, CallbackQuery) else event
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")]])
+
     if not rows:
-        if not is_admin:
-            await msg.answer(f"📭 Домашних заданий {target_title} ({target_d.strftime('%d.%m')}) пока нет.", reply_markup=kb)
+        empty_text = f"📭 Домашних заданий {target_title} ({target_d.strftime('%d.%m')}) пока нет." if not is_admin else "📭 В очереди нет активных заданий."
+        if isinstance(event, CallbackQuery):
+            await event.message.edit_text(empty_text, reply_markup=back_kb)
+            await event.answer()
         else:
-            await msg.answer("📭 В очереди нет активных заданий.", reply_markup=kb)
+            await event.answer(empty_text, reply_markup=back_kb)
         return
 
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+
     total = len(rows)
-    if not is_admin:
-        await msg.answer(f"📋 <b>Задания {target_title} ({target_d.strftime('%d.%m')}):</b>", reply_markup=kb, parse_mode="HTML")
-    else:
-        await msg.answer(f"📋 <b>В очереди заданий: {total}</b>", reply_markup=kb, parse_mode="HTML")
+    header_msg = f"📋 <b>Задания {target_title} ({target_d.strftime('%d.%m')}):</b>" if not is_admin else f"📋 <b>В очереди заданий: {total}</b>"
+    await bot.send_message(user_id, header_msg, parse_mode="HTML")
 
     for idx, row in enumerate(rows, start=1):
         send_date_obj = datetime.strptime(row["send_date"], "%Y-%m-%d").date()
-        if row["lesson_date"]:
-            lesson_date_obj = datetime.strptime(row["lesson_date"], "%Y-%m-%d").date()
-        else:
-            lesson_d, _ = find_next_lesson_date(row["subject"])
-            lesson_date_obj = lesson_d if lesson_d else (send_date_obj + timedelta(days=1))
-        
+        lesson_date_obj = datetime.strptime(row["lesson_date"], "%Y-%m-%d").date() if row["lesson_date"] else (send_date_obj + timedelta(days=1))
         send_weekday = DAYS_MAP[send_date_obj.weekday()].capitalize()
         lesson_weekday = DAYS_MAP[lesson_date_obj.weekday()].capitalize()
 
         photos = get_photo_list(row["photo_id"])
-        task_display = row["task_text"]
-        if "<blockquote>" not in task_display:
-            task_display = f"<blockquote>{html.escape(task_display)}</blockquote>"
+        task_display = row["task_text"] if "<blockquote>" in row["task_text"] else f"<blockquote>{html.escape(row['task_text'])}</blockquote>"
 
         card_text = (
             f"📌 <b>Задание {idx} из {total}</b>\n"
             f"📚 <b>Предмет:</b> {html.escape(row['subject'].capitalize())}\n"
             f"📅 <b>Урок:</b> {lesson_weekday}, {lesson_date_obj.strftime('%d.%m')}\n"
             f"⏰ <b>Отправка:</b> {send_weekday}, {send_date_obj.strftime('%d.%m')} в 15:10\n\n"
-            f"📝 <b>Задание:</b>\n"
-            f"{task_display}"
+            f"📝 <b>Задание:</b>\n{task_display}"
         )
 
-        card_kb = make_hw_kb(row["id"]) if is_admin else None
+        card_kb = make_hw_kb(row["id"]) if is_admin else (back_kb if idx == total else None)
         if len(photos) > 1:
             note = f"\n\n<i>(Прикреплено фото: {len(photos)} шт.)</i>"
-            await msg.answer_photo(photo=photos[0], caption=card_text + note, reply_markup=card_kb, parse_mode="HTML")
+            await bot.send_photo(user_id, photo=photos[0], caption=card_text + note, reply_markup=card_kb, parse_mode="HTML")
         elif len(photos) == 1:
-            await msg.answer_photo(photo=photos[0], caption=card_text, reply_markup=card_kb, parse_mode="HTML")
+            await bot.send_photo(user_id, photo=photos[0], caption=card_text, reply_markup=card_kb, parse_mode="HTML")
         else:
-            await msg.answer(text=card_text, reply_markup=card_kb, parse_mode="HTML")
+            await bot.send_message(user_id, text=card_text, reply_markup=card_kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "adm_send")
+async def adm_send_cb(call: CallbackQuery):
+    if call.from_user.id != ADMIN_CHAT_ID:
+        return
+    count = await send_due_homework(force_resend=False)
+    if count == 0:
+        count = await send_due_homework(force_resend=True)
+    await call.answer(f"Отправлено заданий: {count}" if count > 0 else "Нет заданий на сегодня.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("change_date_menu:"))
 async def change_date_menu_callback(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
-        await call.answer("Только староста может менять даты.")
         return
-
     hw_id = int(call.data.split(":")[1])
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT subject FROM homework WHERE id = ?", (hw_id,)) as cursor:
             row = await cursor.fetchone()
-
     if not row:
-        await call.answer("Задание не найдено.")
+        await call.answer("Не найдено")
         return
 
     upcoming = get_all_upcoming_lessons(row["subject"], limit=4)
-    if not upcoming:
-        await call.answer("У этого предмета нет других уроков в расписании.")
-        return
-
-    buttons = []
-    for u in upcoming:
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{u['lesson_display']} (отправка {u['reminder_display']})",
-                callback_data=f"set_ld:{hw_id}:{u['lesson_date']}:{u['reminder_date']}"
-            )
-        ])
-    buttons.append([InlineKeyboardButton(text="❌ Назад", callback_data=f"cancel_date_change")])
-
-    await call.message.reply(
-        f"📅 <b>Выбери, на какой день перенести {html.escape(row['subject'].capitalize())}:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML"
-    )
+    buttons = [[InlineKeyboardButton(text=f"{u['lesson_display']}", callback_data=f"set_ld:{hw_id}:{u['lesson_date']}:{u['reminder_date']}")] for u in upcoming]
+    buttons.append([InlineKeyboardButton(text="❌ Назад", callback_data="cancel_date_change")])
+    await call.message.reply(f"📅 <b>Выбери новый день для {html.escape(row['subject'].capitalize())}:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await call.answer()
 
 @dp.callback_query(F.data.startswith("set_ld:"))
 async def set_lesson_date_callback(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
         return
-
     _, hw_id_str, les_d_str, rem_d_str = call.data.split(":")
-    hw_id = int(hw_id_str)
-
     async with aiosqlite.connect("school.db") as db:
-        await db.execute(
-            "UPDATE homework SET lesson_date = ?, send_date = ? WHERE id = ?",
-            (les_d_str, rem_d_str, hw_id)
-        )
+        await db.execute("UPDATE homework SET lesson_date = ?, send_date = ? WHERE id = ?", (les_d_str, rem_d_str, int(hw_id_str)))
         await db.commit()
-
     await sync_backup()
     await call.message.delete()
-    await call.answer("День урока успешно изменен!")
-    
-    les_obj = datetime.strptime(les_d_str, "%Y-%m-%d").date()
-    rem_obj = datetime.strptime(rem_d_str, "%Y-%m-%d").date()
-    await bot.send_message(
-        ADMIN_CHAT_ID,
-        f"✅ <b>День урока перенесен:</b>\n"
-        f"📅 Новый день урока: <b>{DAYS_MAP[les_obj.weekday()].capitalize()}, {les_obj.strftime('%d.%m')}</b>\n"
-        f"⏰ Отправка: <b>{DAYS_MAP[rem_obj.weekday()].capitalize()}, {rem_obj.strftime('%d.%m')} в 15:10</b>",
-        parse_mode="HTML"
-    )
+    await call.answer("День урока изменен!")
 
 @dp.callback_query(F.data == "cancel_date_change")
 async def cancel_date_change_callback(call: CallbackQuery):
     await call.message.delete()
-    await call.answer("Отменено")
+    await call.answer()
 
-# Официальное сообщение для группы
 async def send_hw_item(subject: str, task_text: str, photo_field: str | None, lesson_date_str: str | None = None):
     photos = get_photo_list(photo_field)
     task_display = task_text if "<blockquote>" in task_text else f"<blockquote>{html.escape(task_text)}</blockquote>"
@@ -1836,11 +1864,7 @@ async def send_hw_item(subject: str, task_text: str, photo_field: str | None, le
         lesson_d, _ = find_next_lesson_date(subject)
         target_day_name = ACCUSATIVE_DAYS.get(lesson_d.weekday(), "следующий урок") if lesson_d else "следующий урок"
 
-    header = (
-        f"<b>Домашнее задание на {target_day_name}:</b>\n"
-        f"<b>Предмет:</b> {html.escape(subject.capitalize())}\n\n"
-        f"{task_display}"
-    )
+    header = f"<b>Домашнее задание на {target_day_name}:</b>\n<b>Предмет:</b> {html.escape(subject.capitalize())}\n\n{task_display}"
 
     if not photos:
         await bot.send_message(chat_id=ADMIN_CHAT_ID, text=header, parse_mode="HTML")
@@ -1855,21 +1879,15 @@ async def send_hw_item(subject: str, task_text: str, photo_field: str | None, le
 @dp.callback_query(F.data.startswith("send_one:"))
 async def send_one_callback(call: CallbackQuery):
     if call.from_user.id != ADMIN_CHAT_ID:
-        await call.answer("Только староста может выгружать задания.")
         return
-
     hw_id = int(call.data.split(":")[1])
     async with aiosqlite.connect("school.db") as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT subject, task_text, photo_id, lesson_date FROM homework WHERE id = ?", (hw_id,)) as cursor:
             row = await cursor.fetchone()
-
-    if not row:
-        await call.answer("Задание не найдено.")
-        return
-
-    await send_hw_item(row["subject"], row["task_text"], row["photo_id"], row["lesson_date"])
-    await call.answer("Отправлено в чат!")
+    if row:
+        await send_hw_item(row["subject"], row["task_text"], row["photo_id"], row["lesson_date"])
+        await call.answer("Отправлено в чат!")
 
 @dp.callback_query(F.data.startswith("del_hw:"))
 async def delete_hw_callback(call: CallbackQuery):
@@ -1880,156 +1898,39 @@ async def delete_hw_callback(call: CallbackQuery):
         await db.execute("DELETE FROM homework WHERE id = ?", (hw_id,))
         await db.commit()
     await sync_backup()
-    await call.answer("🗑 Задание удалено.")
-    del_text = "🗑 <b>Задание удалено из очереди.</b>"
+    await call.answer("🗑 Удалено.")
     if call.message.photo:
-        await call.message.edit_caption(caption=del_text, parse_mode="HTML")
+        await call.message.edit_caption(caption="🗑 <b>Задание удалено.</b>", parse_mode="HTML")
     else:
-        await call.message.edit_text(text=del_text, parse_mode="HTML")
+        await call.message.edit_text(text="🗑 <b>Задание удалено.</b>", parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("edit_text:"))
-async def edit_text_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return
-    hw_id = int(call.data.split(":")[1])
-    await state.update_data(hw_id=hw_id)
-    await state.set_state(EditHW.waiting_for_text)
-    await call.answer()
-    await call.message.reply("✏️ <b>Отправь новый текст задания.</b> Для отмены нажми кнопку «❌ Отмена».", parse_mode="HTML")
-
-@dp.message(EditHW.waiting_for_text, F.from_user.id == ADMIN_CHAT_ID)
-async def edit_text_finish(msg: Message, state: FSMContext):
-    new_text = msg.text or msg.caption or ""
-    if not new_text:
-        await msg.answer("⚠️ Текст не может быть пустым. Отправь текст задания заново.")
-        return
-    data = await state.get_data()
-    hw_id = data["hw_id"]
-
-    formatted = format_task_text(new_text, 1)
-
-    async with aiosqlite.connect("school.db") as db:
-        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
-        await db.commit()
-    await sync_backup()
-    await state.clear()
-    
-    await msg.answer(
-        f"✅ <b>Текст задания обновлен:</b>\n\n{formatted}",
-        reply_markup=get_admin_keyboard(),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("ai_edit:"))
-async def ai_edit_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return
-    hw_id = int(call.data.split(":")[1])
-    await state.update_data(hw_id=hw_id)
-    await state.set_state(EditHW.waiting_for_ai_prompt)
-    await call.answer()
-    await call.message.reply(
-        "🤖 <b>Редактирование через ИИ:</b>\n\n"
-        "Напиши, как изменить задание (например: <i>«сделай короче»</i>, <i>«разбей по пунктам»</i>).\n"
-        "Или отправь знак плюс <b>+</b>, чтобы ИИ переписал текст автоматически.\n\n"
-        "Для отмены нажми кнопку «❌ Отмена».",
-        parse_mode="HTML"
-    )
-
-@dp.message(EditHW.waiting_for_ai_prompt, F.from_user.id == ADMIN_CHAT_ID)
-async def ai_edit_finish(msg: Message, state: FSMContext):
-    user_instruction = (msg.text or "").strip()
-    if user_instruction == "+":
-        user_instruction = ""
-
-    data = await state.get_data()
-    hw_id = data["hw_id"]
-
-    wait_msg = await msg.answer("🧠 ИИ переписывает задание...", parse_mode="HTML")
-
-    async with aiosqlite.connect("school.db") as db:
-        async with db.execute("SELECT subject, task_text FROM homework WHERE id = ?", (hw_id,)) as cursor:
-            row = await cursor.fetchone()
-            subj, old_text = row if row else ("Предмет", "")
-
-    better_text = await improve_with_ai(subj, old_text, user_instruction)
-    formatted = f"<blockquote>{html.escape(better_text)}</blockquote>"
-    await wait_msg.delete()
-
-    async with aiosqlite.connect("school.db") as db:
-        await db.execute("UPDATE homework SET task_text = ? WHERE id = ?", (formatted, hw_id))
-        await db.commit()
-    await sync_backup()
-    await state.clear()
-
-    await msg.answer(
-        f"✅ <b>Результат от ИИ:</b>\n\n{formatted}",
-        reply_markup=get_admin_keyboard(),
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data.startswith("edit_subj:"))
-async def edit_subj_start(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_CHAT_ID:
-        return
-    hw_id = int(call.data.split(":")[1])
-    await state.update_data(hw_id=hw_id)
-    await state.set_state(EditHW.waiting_for_subject)
-    await call.answer()
-    await call.message.reply("🔄 <b>Напиши новое название предмета.</b> Для отмены нажми кнопку «❌ Отмена».", parse_mode="HTML")
-
-@dp.message(EditHW.waiting_for_subject, F.from_user.id == ADMIN_CHAT_ID)
-async def edit_subj_finish(msg: Message, state: FSMContext):
-    new_subj = (msg.text or "").strip()
-    lesson_date, matched_name = find_next_lesson_date(new_subj)
-    if not lesson_date:
-        await msg.answer(f"❌ Предмет «{html.escape(new_subj)}» не найден в расписании 8-Б класса.", parse_mode="HTML")
-        return
-
-    reminder_date = calculate_reminder_date(lesson_date)
-    send_date_str = reminder_date.strftime("%Y-%m-%d")
-    les_date_str = lesson_date.strftime("%Y-%m-%d")
-
-    data = await state.get_data()
-    hw_id = data["hw_id"]
-
-    async with aiosqlite.connect("school.db") as db:
-        await db.execute(
-            "UPDATE homework SET subject = ?, send_date = ?, lesson_date = ? WHERE id = ?",
-            (matched_name, send_date_str, les_date_str, hw_id)
-        )
-        await db.commit()
-
-    await sync_backup()
-    await state.clear()
-    
-    send_weekday = DAYS_MAP[reminder_date.weekday()].capitalize()
-    lesson_weekday = DAYS_MAP[lesson_date.weekday()].capitalize()
-
-    await msg.answer(
-        f"✅ <b>Предмет изменен на:</b> {html.escape(matched_name)}\n"
-        f"📅 <b>Урок будет:</b> {lesson_weekday}, {lesson_date.strftime('%d.%m')}\n"
-        f"⏰ <b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:10",
-        reply_markup=get_admin_keyboard(),
-        parse_mode="HTML"
-    )
-
-# Прием заданий через чат (только Админ)
+# Прием любых текстовых сообщений и фото (с жестким анти-спамом для учеников)
 @dp.message(StateFilter(None))
-async def handle_homework(msg: Message):
-    await track_user_and_notify(msg)
+async def handle_incoming(msg: Message):
+    is_admin = (msg.from_user.id == ADMIN_CHAT_ID)
+    
+    # Проверка на спам и бан для одноклассников
+    is_spam, warn = check_antispam(msg.from_user.id, is_text_msg=True)
+    if is_spam:
+        if warn:
+            await msg.answer(warn)
+        return
 
-    if msg.from_user.id != ADMIN_CHAT_ID:
-        target_d, target_title = get_target_lesson_date()
+    user_text = msg.text or (msg.caption if msg.photo else "Отправил вложение")
+    await log_user_message(
+        msg.from_user.id, msg.from_user.username or "", msg.from_user.full_name or "Ученик",
+        user_text, sender="admin" if is_admin else "student"
+    )
+
+    if not is_admin:
         await msg.answer(
-            f"🔒 <b>Режим ученика:</b> добавлять ДЗ может только староста.\n\n"
-            f"• Нажми <b>«📚 Список ДЗ»</b>, чтобы посмотреть задания {target_title} ({target_d.strftime('%d.%m')})\n"
-            f"• Нажми <b>«📅 Расписание»</b>, чтобы посмотреть уроки недели",
-            reply_markup=get_student_keyboard(),
+            "✉️ <b>Сообщение передано старосте!</b>\nЧтобы посмотреть ДЗ или расписание, используй меню:",
+            reply_markup=get_student_inline_menu(),
             parse_mode="HTML"
         )
         return
 
+    # Если пишет или шлет фото админ
     if msg.media_group_id:
         mg_id = msg.media_group_id
         if mg_id not in media_group_cache:
@@ -2039,18 +1940,13 @@ async def handle_homework(msg: Message):
                 "msg": msg
             }
         else:
-            if msg.photo:
-                media_group_cache[mg_id]["photos"].append(msg.photo[-1].file_id)
-            if msg.caption:
-                media_group_cache[mg_id]["caption"] = msg.caption
+            if msg.photo: media_group_cache[mg_id]["photos"].append(msg.photo[-1].file_id)
+            if msg.caption: media_group_cache[mg_id]["caption"] = msg.caption
 
         await asyncio.sleep(1.0)
-
         if mg_id in media_group_cache:
             data = media_group_cache.pop(mg_id)
-            photos = data["photos"]
-            raw_text = (data["caption"] or "").strip()
-            msg = data["msg"]
+            photos, raw_text, msg = data["photos"], (data["caption"] or "").strip(), data["msg"]
         else:
             return
     else:
@@ -2058,7 +1954,7 @@ async def handle_homework(msg: Message):
         raw_text = (msg.caption if msg.photo else (msg.text or "")).strip()
 
     if photos and not raw_text:
-        await msg.answer("⚠️ Ты отправил фото без названия предмета. Напиши предмет в подписи к фото (например: <code>Химия</code>).", reply_markup=get_admin_keyboard(), parse_mode="HTML")
+        await msg.answer("⚠️ Ты отправил фото без названия предмета. Напиши предмет в подписи.")
         return
 
     if ":" in raw_text:
@@ -2069,7 +1965,7 @@ async def handle_homework(msg: Message):
 
     lesson_date, matched_name = find_next_lesson_date(subject)
     if not lesson_date:
-        await msg.answer(f"❌ Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.", reply_markup=get_admin_keyboard(), parse_mode="HTML")
+        await msg.answer(f"❌ Предмет «{html.escape(subject)}» не найден в расписании 8-Б класса.")
         return
 
     final_text = format_task_text(task, len(photos))
@@ -2096,14 +1992,12 @@ async def handle_homework(msg: Message):
         f"📚 <b>Предмет:</b> {html.escape(matched_name)}\n"
         f"📅 <b>Урок:</b> {lesson_weekday}, {lesson_date.strftime('%d.%m')}\n"
         f"⏰ <b>Отправка:</b> {send_weekday}, {reminder_date.strftime('%d.%m')} в 15:10\n\n"
-        f"📝 <b>Задание:</b>\n"
-        f"{final_text}"
+        f"📝 <b>Задание:</b>\n{final_text}"
     )
 
     kb = make_hw_kb(hw_id)
     if len(photos) > 1:
-        media = [InputMediaPhoto(media=p) for p in photos]
-        await msg.answer_media_group(media=media)
+        await msg.answer_media_group(media=[InputMediaPhoto(media=p) for p in photos])
         await msg.answer(confirm, reply_markup=kb, parse_mode="HTML")
     elif len(photos) == 1:
         await msg.answer_photo(photo=photos[0], caption=confirm, reply_markup=kb, parse_mode="HTML")
@@ -2131,34 +2025,44 @@ async def send_due_homework(force_resend: bool = False) -> int:
                     sent_count += 1
                 except Exception as e:
                     logging.error(f"Ошибка отправки ДЗ #{row['id']}: {e}")
-
             await db.commit()
 
     if sent_count > 0:
         await sync_backup()
     return sent_count
 
-@dp.message(F.text.in_(["Отправить сейчас", "⚡️ Отправить сейчас", "⚡ Отправить сейчас"]))
 @dp.message(Command("send"))
 async def manual_send_cmd(msg: Message):
-    await track_user_and_notify(msg)
     if msg.from_user.id != ADMIN_CHAT_ID:
         return
     count = await send_due_homework(force_resend=False)
     if count == 0:
         count = await send_due_homework(force_resend=True)
-
-    if count == 0:
-        await msg.answer("📭 В базе нет заданий на сегодня или ранее.", reply_markup=get_admin_keyboard())
-    else:
-        await msg.answer(f"✅ Отправлено заданий: {count}", reply_markup=get_admin_keyboard())
+    await msg.answer(f"✅ Отправлено заданий: {count}" if count > 0 else "📭 Заданий нет.")
 
 async def main():
     await init_db()
     await start_web_server()
     await restore_from_backup()
     await fix_database_quotes_and_dates()
-    
+
+    # Устанавливаем нативные команды меню слева от строки ввода
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="dz", description="Домашнее задание"),
+        BotCommand(command="schedule", description="Расписание уроков"),
+    ])
+
+    # Для старосты ставим синюю кнопку "Сайт" в левый нижний угол Telegram!
+    if WEBAPP_URL and WEBAPP_URL.startswith("https://"):
+        try:
+            await bot.set_chat_menu_button(
+                chat_id=ADMIN_CHAT_ID,
+                menu_button=MenuButtonWebApp(text="Сайт", web_app=WebAppInfo(url=f"{WEBAPP_URL}/webapp"))
+            )
+        except Exception as e:
+            logging.error(f"Ошибка установки MenuButton: {e}")
+
     scheduler.add_job(send_due_homework, "cron", hour=SEND_HOUR, minute=SEND_MINUTE)
     scheduler.start()
     
